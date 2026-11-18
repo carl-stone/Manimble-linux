@@ -10,9 +10,8 @@ from PIL import Image
 from manimble_linux.extraction import (
     ExtractionState, ImageExtractor, Tool, build_insert_request, save_parts,
 )
-from manimble_linux.extract_runtime import (
-    ExtractionRuntimeError, supported_python, verify_checkpoint,
-)
+from manimble_linux.extract_runtime import ExtractionRuntimeError, verify_model
+from manimble_linux.extract_worker import in_box, pieces
 from manimble_linux.image_fill import FillError, inpaint
 from manimble_linux.models import Box
 
@@ -138,26 +137,47 @@ class FillTests(unittest.TestCase):
         np.testing.assert_array_equal(inpaint(rgba,np.zeros((8,9),bool)),rgba)
 
 
-class CheckpointTests(unittest.TestCase):
+class ModelTests(unittest.TestCase):
     def test_digest_mismatch_refused_with_small_manifest(self):
         with tempfile.TemporaryDirectory() as directory:
-            file = Path(directory)/"checkpoint.pt"
+            file = Path(directory)/"model.onnx"
             file.write_bytes(b"small pinned weights")
             manifest = {"bytes":file.stat().st_size,"sha256":hashlib.sha256(file.read_bytes()).hexdigest()}
-            self.assertEqual(verify_checkpoint(file,manifest),file)
+            self.assertEqual(verify_model(file,manifest),file)
             file.write_bytes(b"small forged weights")
             with self.assertRaisesRegex(ExtractionRuntimeError,"SHA-256 mismatch"):
-                verify_checkpoint(file,manifest)
+                verify_model(file,manifest)
             file.write_bytes(b"short")
             with self.assertRaisesRegex(ExtractionRuntimeError,"size mismatch"):
-                verify_checkpoint(file,manifest)
+                verify_model(file,manifest)
 
-    def test_interpreter_versions(self):
-        self.assertTrue(supported_python((3,11,0)))
-        self.assertTrue(supported_python((3,14,8)))
-        self.assertFalse(supported_python((3,14,1)))
-        self.assertFalse(supported_python((3,10,19)))
-        self.assertFalse(supported_python((3,15,0)))
+    def test_pieces_split_drop_specks_and_keep_own_fringe(self):
+        soft = np.zeros((300,300),np.uint8)
+        soft[10:40,10:40] = 255
+        soft[40,10:40] = 90          # soft edge of the first piece
+        soft[10:40,42:60] = 255      # a second piece two pixels away
+        soft[200,200] = 255          # a speck
+        found = list(pieces(soft))
+        self.assertEqual(len(found),2)
+        first,second = found
+        self.assertEqual(int(first[40,20]),90)
+        self.assertEqual(int(first[20,45]),0)
+        self.assertEqual(int(second[20,45]),255)
+        self.assertTrue(all(int(m[200,200])==0 for m in found))
+
+    def test_box_keeps_pieces_mostly_inside_and_clips(self):
+        soft = np.zeros((100,100),np.uint8)
+        soft[20:40,20:40] = 255      # wholly inside the box
+        soft[20:40,45:85] = 255      # only a quarter inside: not chosen while another piece is
+        out = in_box(soft,(15,15,55,45))
+        self.assertEqual(int(out[30,30]),255)
+        self.assertEqual(int(out[30,50]),0)
+        # Nothing mostly inside: the piece with most area inside wins if it covers >10% of the box, clipped to it.
+        soft[20:40,20:40] = 0
+        out = in_box(soft,(15,15,55,45))
+        self.assertEqual(int(out[30,50]),255)
+        self.assertEqual(int(out[30,60]),0)
+        self.assertIsNone(in_box(soft,(0,0,46,90)))
 
 
 if __name__ == "__main__":

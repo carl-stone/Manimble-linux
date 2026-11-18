@@ -15,8 +15,9 @@ Select a picture to move and resize it. Its file name is shown in the inspector.
 ## Extract elements from a picture
 
 **Insert ▸ Extract Elements from Image…** splits a picture into its separate subjects (the people in a photo, the
-parts of a figure), so each can be moved, resized and animated on its own. It uses the subject-lifting model built
-into macOS, and needs macOS 14 or later.
+parts of a figure), so each can be moved, resized and animated on its own. On macOS it uses the subject-lifting model
+built into macOS 14 or later. On Linux it uses the IS-Net model, downloaded the first time you use it (179 MB); it
+runs on your computer, and subjects that touch come out as one element.
 
 1. Select a picture on the slide.
 2. Choose **Insert ▸ Extract Elements from Image…**. A sheet shows the picture with each element the model found

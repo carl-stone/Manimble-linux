@@ -28,9 +28,8 @@ Installation copies the application rather than linking to the checkout, so the 
 |---|---|
 | `$XDG_DATA_HOME/manimble/app/` | Copied engine, Linux front end, CLI, version and license |
 | `$XDG_DATA_HOME/manimble/python/` | Private GUI and engine Python environment |
-| `$XDG_DATA_HOME/manimble/extract/` | Optional model environment, created only by the extraction installer |
 | `$XDG_CONFIG_HOME/manimble/` | Nonsecret preferences |
-| `$XDG_CACHE_HOME/manimble/` | Renders, voice audio, model checkpoints and downloads |
+| `$XDG_CACHE_HOME/manimble/` | Renders, voice audio, the extraction model and downloads |
 | `$XDG_STATE_HOME/manimble/` | Working copies and logs |
 | `$HOME/.local/bin/` | `manimble` and `manimbler` launchers |
 
@@ -51,7 +50,7 @@ The launchers work from any current directory, including when installation paths
 
 Manimble edits a working copy and writes changed files back only on Save to Original. Authored symlinks and terminal commands operating on external assets can still change external files, so the working copy is not a sandbox. Save Project Copy preserves unsaved changes without changing the original association.
 
-Keynote `.key` and legacy `.ppt` conversions require macOS. Use `.pptx` on Linux. The extraction model is an optional separate installation with its own download consent. Manual extraction and background fill do not need the model.
+Keynote `.key` and legacy `.ppt` conversions require macOS. Use `.pptx` on Linux. Extract Elements uses the IS-Net model (179 MB), downloaded on first use with its own consent and run on the CPU by the main private Python. Manual extraction and background fill do not need the model.
 
 ## Develop
 
@@ -82,7 +81,7 @@ PYTHONPATH="$PWD/apps/linux:$PWD/engine" QT_API=pyside6 \
 ~/.local/bin/manimbler --help
 ```
 
-If AppArmor requires the exact-path WebEngine profile, approve it separately during installation or add `--install-webengine-profile`. CI adds the flag only when the runner's AppArmor user namespace restriction is enabled. The tests do not install the optional model, call paid voice providers or submit public BioCartoon assets.
+If AppArmor requires the exact-path WebEngine profile, approve it separately during installation or add `--install-webengine-profile`. CI adds the flag only when the runner's AppArmor user namespace restriction is enabled. The tests do not download the optional model, call paid voice providers or submit public BioCartoon assets.
 
 Automated tests do not establish desktop parity on their own. Check actual editor rendering, terminal input and resizing, working-copy Save/Revert/conflicts, portable project relocation, audio/video playback, extraction, plots and BioCartoon on both Wayland and X11. Check audience/presenter separation and monitor removal on a desktop with two displays. Exchange a saved project with macOS before claiming format parity.
 

@@ -14,7 +14,7 @@ import numpy as np
 from PIL import Image, ImageFilter, ImageOps
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
 from PySide6.QtGui import QColor, QImage, QKeySequence, QPainter, QPen, QShortcut
-from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QDialog, QFileDialog, QHBoxLayout,
+from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QDialog, QHBoxLayout,
     QLabel, QMessageBox, QProgressBar, QPushButton, QSlider, QVBoxLayout, QWidget)
 
 from .extract_runtime import DISCLOSURE, ExtractRuntime
@@ -401,7 +401,7 @@ class ExtractEditor(QDialog):
         self.status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         layout.addWidget(self.status)
         progress_row = QHBoxLayout()
-        self.install_button = QPushButton("Install extraction model…")
+        self.install_button = QPushButton("Download extraction model…")
         self.install_button.clicked.connect(self.install_model)
         progress_row.addWidget(self.install_button)
         self.progress = QProgressBar()
@@ -613,7 +613,7 @@ class ExtractEditor(QDialog):
 
     def _infer(self,box):
         if self.extract_runtime is None or not self.extract_runtime.available:
-            self.status.setText("Install extraction model for Box prediction / Find Elements. Shift-drag a Whole Box, or paint with Keep, without it.")
+            self.status.setText("Download the extraction model for Box prediction / Find Elements. Shift-drag a Whole Box, or paint with Keep, without it.")
             return
         if self._model_worker is None:
             spawn(self._infer_task(box))
@@ -636,7 +636,7 @@ class ExtractEditor(QDialog):
             if self._closed or epoch != self._operation_epoch or generation != self.state.generation:
                 return
             count = self.state.add_masks(masks,region=box,deduplicate=box is None)
-            self.status.setText(f"Added {count} editable candidates" if count else "No new separate elements found. Try Whole Box or Keep.")
+            self.status.setText(f"Added {count} element{'s' if count != 1 else ''}" if count else "No new separate elements found. Try Whole Box or Keep.")
         except Exception as exc:
             if not self._closed:
                 self.status.setText(str(exc))
@@ -652,34 +652,30 @@ class ExtractEditor(QDialog):
     def install_model(self):
         if self.extract_runtime is None or self._model_worker is not None:
             return
-        answer = QMessageBox.question(self,"Install extraction model",DISCLOSURE,
+        answer = QMessageBox.question(self,"Download extraction model",DISCLOSURE,
             QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.Cancel,QMessageBox.StandardButton.Cancel)
         if answer != QMessageBox.StandardButton.Yes:
             return
         spawn(self._install_model())
 
     def _install_model(self):
-        python = self.runtime.python
-        while not self._closed:
-            try:
-                worker = self.extract_runtime.install_worker(python)
-                self._model_worker = worker
-                self.refresh_controls()
-                yield self._track(worker)
-                self.status.setText("Model installed. Find Elements returns editable candidates; segments may differ from Apple Vision.")
-                return
-            except Exception as exc:
+        try:
+            worker = self.extract_runtime.install_worker()
+            self._model_worker = worker
+            self.refresh_controls()
+            yield self._track(worker)
+        except Exception as exc:
+            if not self._closed:
                 self.status.setText(str(exc))
-                if "choose another installed interpreter" not in str(exc):
-                    return
-                python,_ = QFileDialog.getOpenFileName(self,"Choose installed Python 3.11–3.14 (not 3.14.1)",str(Path(python).parent))
-                if not python:
-                    return
-            finally:
-                self._model_worker = None
-                self.progress.hide()
-                self.cancel_work.hide()
-                self.refresh_controls()
+            return
+        finally:
+            self._model_worker = None
+            self.progress.hide()
+            self.cancel_work.hide()
+            self.refresh_controls()
+        if not self._closed:
+            self.status.setText("Model downloaded. Elements may differ from Apple Vision.")
+            self.detect_pressed()
 
     def insert_pressed(self):
         if not self.state.elements:
@@ -872,7 +868,7 @@ class ExtractMixin:
                 # Noninteractive callers must explicitly request model inference;
                 # absence/error is never turned into a fabricated whole-box mask.
                 if not model.available:
-                    raise RuntimeError("Install extraction model first; manual extraction remains available")
+                    raise RuntimeError("Download the extraction model first; manual extraction remains available")
                 with tempfile.TemporaryDirectory(prefix="manimble-extract-auto-") as directory:
                     image_file,_ = yield run_blocking(_stage,image,[],directory)
                     worker = model.inference_worker(image_file,Path(directory)/"masks")

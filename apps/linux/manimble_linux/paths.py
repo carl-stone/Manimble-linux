@@ -58,10 +58,6 @@ class AppPaths:
         return self.data / "python" / "bin" / "python"
 
     @property
-    def extract_python(self) -> Path:
-        return self.data / "extract" / "bin" / "python"
-
-    @property
     def work(self) -> Path:
         """Working copies of open decks (Workspace)."""
         return self.state / "work"

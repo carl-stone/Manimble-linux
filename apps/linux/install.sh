@@ -16,8 +16,8 @@ Usage: install_manimble.sh [OPTIONS]
   --help                       Show this help
 
 Requires system Python 3.11 through 3.14. No Python runtime is downloaded.
---yes alone never approves the AppArmor exception. The extraction model is optional
-and is not installed here. Existing decks, preferences and MIME defaults are kept.
+--yes alone never approves the AppArmor exception. The extraction model is downloaded
+on first use, not here. Existing decks, preferences and MIME defaults are kept.
 EOF
 }
 for arg in "$@"; do
@@ -272,4 +272,4 @@ if command -v update-mime-database >/dev/null; then update-mime-database "$DATA/
 if command -v update-desktop-database >/dev/null; then update-desktop-database "$DATA/applications"; fi
 if command -v gtk-update-icon-cache >/dev/null; then gtk-update-icon-cache --force --ignore-theme-index "$DATA/icons/hicolor"; fi
 printf 'Installed Manimble. Run %s or open Manimble from your application launcher.\n' "$BIN/manimble"
-echo 'No default file handler was changed. Optional extraction models were not installed.'
+echo 'No default file handler was changed. The extraction model is downloaded on first use.'

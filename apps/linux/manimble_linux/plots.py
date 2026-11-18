@@ -17,17 +17,19 @@ from concurrent.futures import CancelledError, Future
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Qt, QTimer
-from PySide6.QtGui import QFontDatabase, QKeySequence, QShortcut
+from PySide6.QtCore import QDir, QObject, QPoint, QProcess, QProcessEnvironment, QRect, QRectF, Qt, QTimer
+from PySide6.QtGui import QColor, QFont, QGuiApplication, QKeySequence, QPainter, QPalette, QShortcut
 from PySide6.QtWidgets import (
-    QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
-    QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QVBoxLayout,
+    QButtonGroup, QFileDialog, QFrame, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
+    QPlainTextEdit, QPushButton, QSizePolicy, QStyle, QStyleOptionFrame, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from .models import frame_size, unit_px
 from .paths import RESOURCES
+from .style import Theme, watch_appearance
 from .tasks import spawn
 from .workers import run_blocking
+from .widgets import add_copy_button, field_label
 
 
 @dataclass(eq=True)
@@ -126,18 +128,17 @@ class _Command(QObject):
         elif code == 0 and status == QProcess.ExitStatus.NormalExit and not self.timed_out:
             self.future.set_result(self.log)
         else:
-            tail = "\n".join(self.log.strip().splitlines()[-14:])
-            # Long/chained tracebacks are evidence, not expendable console noise.
-            at = self.log.find("Traceback (most recent call last):")
-            if at >= 0 and self.log[at:].strip() not in tail:
-                tail += "\n\n" + self.log[at:].strip()
+            text = self.log.strip()
+            # Keep chained and long tracebacks intact, without repeating their tail.
+            at = text.find("Traceback (most recent call last):")
+            tail = text[at:] if at >= 0 else "\n".join(text.splitlines()[-14:])
             if self.timed_out:
                 tail = (f"The code ran for {self.timeout // 60} minutes and was stopped.\n" if self.timeout >= 60
                         else f"The Python probe timed out after {self.timeout} seconds.\n") + tail
-            if "No module named" in self.log:
-                tail += f"\n\nThis Python ({self.python}) is missing a package: install it there, or choose another Python."
-            self.future.set_exception(RunError(tail or f"The code failed (exit {code}).", self.python,
-                                              "No module named 'seaborn'" in self.log))
+            no_seaborn = "No module named 'seaborn'" in self.log
+            if not no_seaborn and "No module named" in self.log:
+                tail += f"\n\nThis Python ({self.python}) is missing a package: install it there, or choose another Python below."
+            self.future.set_exception(RunError(tail or f"The code failed (exit {code}).", self.python, no_seaborn))
 
 
 class PythonPlot:
@@ -148,8 +149,7 @@ x = np.linspace(0, 2 * np.pi, 200)
 fig, ax = plt.subplots(figsize=(6, 4))
 ax.plot(x, np.sin(x), label="sin x")
 ax.plot(x, np.cos(x), label="cos x")
-ax.legend()
-'''
+ax.legend()'''
 
     @staticmethod
     def plot(of_image: str | Path) -> tuple[Path, str] | None:
@@ -310,6 +310,47 @@ class PlotRun:
                 yield run_blocking(shutil.rmtree, tmp)
 
 
+class _PlotFileField(QLineEdit):
+    """Keep the full editable path; when not editing, show its filename first."""
+    def paintEvent(self, event):
+        option = QStyleOptionFrame()
+        self.initStyleOption(option)
+        rect = self.style().subElementRect(QStyle.SubElement.SE_LineEditContents, option, self)
+        margins = self.textMargins()
+        rect.adjust(margins.left() + 2, margins.top(), -margins.right() - 2, -margins.bottom())
+        metrics = self.fontMetrics()
+        if self.hasFocus() or metrics.horizontalAdvance(self.text()) <= rect.width():
+            super().paintEvent(event)
+            return
+        painter = QPainter(self)
+        self.style().drawPrimitive(QStyle.PrimitiveElement.PE_PanelLineEdit, option, painter, self)
+        painter.setPen(self.palette().text().color())
+        painter.drawText(rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
+                         metrics.elidedText(self.text(), Qt.TextElideMode.ElideLeft, rect.width()))
+
+
+class _PlotPythonLabel(QLabel):
+    def __init__(self):
+        super().__init__()
+        self._full_text = ""
+        self.setTextFormat(Qt.TextFormat.PlainText)
+        self.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+
+    def set_path(self, path):
+        self._full_text = "Python: " + (path or "automatic (one with matplotlib)")
+        self.setAccessibleName(self._full_text)
+        self.setToolTip(path)
+        self.elide()
+
+    def elide(self):
+        self.setText(self.fontMetrics().elidedText(
+            self._full_text, Qt.TextElideMode.ElideMiddle, self.contentsRect().width()))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.elide()
+
+
 class PlotEditor(QFrame):
     """Semitransient plot popover: click away/Render commits; Escape/Cancel discards."""
     def __init__(self, spec: PlotSpec, error: str | None, deck: Path, settings, parent=None):
@@ -317,97 +358,223 @@ class PlotEditor(QFrame):
         self.deck, self.settings = Path(deck), settings
         self.on_done = None
         self.on_cancel = None
-        self.cancelled = False
+        self.render_requested = False
+        self._cancelled = False
         self._delivered = False
-        self._choosing = False
+        self._chooser = None
+        self._anchor = None
         self.setWindowTitle("Python Plot")
-        self.resize(600, 440)
+        self.setAutoFillBackground(True)
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setFont(Theme.font(11))
+
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(8)
         head = QHBoxLayout()
-        head.addWidget(QLabel("Python Plot"))
+        title = QLabel("Python Plot")
+        title.setFont(Theme.font(13, QFont.Weight.Bold))
+        head.addWidget(title)
         head.addStretch()
-        self.mode = QComboBox()
-        self.mode.addItems(["Code", "File"])
-        self.mode.setCurrentIndex(1 if spec.file else 0)
-        head.addWidget(self.mode)
+        self.segments = QWidget()
+        self.segments.setObjectName("plotModes")
+        modes = QHBoxLayout(self.segments)
+        modes.setContentsMargins(0, 0, 0, 0)
+        modes.setSpacing(0)
+        self.mode = QButtonGroup(self)
+        for index, label in enumerate(("Code", "File")):
+            segment = QPushButton(label)
+            segment.setObjectName(f"plotMode{label}")
+            segment.setCheckable(True)
+            modes.addWidget(segment)
+            self.mode.addButton(segment, index)
+        self.mode.button(1 if spec.file is not None else 0).setChecked(True)
+        head.addWidget(self.segments)
         layout.addLayout(head)
+
         self.code_view = QPlainTextEdit()
-        self.code_view.setFont(QFontDatabase.systemFont(QFontDatabase.SystemFont.FixedFont))
+        self.code_view.setFont(Theme.mono(12))
         self.code_view.setPlainText(spec.code if spec.code is not None else PythonPlot.template)
-        self.code_view.setMinimumHeight(260)
+        self.code_view.setFixedHeight(260)
+        self.code_view.setViewportMargins(0, 2, 0, 2)
+        self.code_view.setAccessibleName("Python code")
         layout.addWidget(self.code_view)
-        self.file_row = QFrame()
+
+        self.file_row = QWidget()
         file_layout = QHBoxLayout(self.file_row)
         file_layout.setContentsMargins(0, 0, 0, 0)
-        self.file_field = QLineEdit(spec.file or "")
-        self.file_field.setPlaceholderText("/path/to/plot.py, or a deck-relative path")
-        file_layout.addWidget(self.file_field)
+        self.file_field = _PlotFileField(str(self.file_path(spec.file)) if spec.file else "")
+        self.file_field.setPlaceholderText("/path/to/plot.py")
+        self.file_field.setAccessibleName("Python file")
+        file_layout.addWidget(self.file_field, 1)
         choose = QPushButton("Choose…")
         choose.clicked.connect(self.choose_file)
         file_layout.addWidget(choose)
         layout.addWidget(self.file_row)
-        hint = QLabel('Runs when you click away. The last matplotlib/seaborn figure becomes the picture, or save PNG to os.environ["MANIMBLE_PLOT_OUT"]. Hover the plot and press ▶ to rerun.')
+
+        hint = field_label('Runs when you click away. The last matplotlib (or seaborn) figure becomes the picture '
+                           '(or save one to os.environ["MANIMBLE_PLOT_OUT"]). Hover the plot and press ▶ to run it again.')
+        hint.setTextFormat(Qt.TextFormat.PlainText)
         hint.setWordWrap(True)
         layout.addWidget(hint)
-        self.error_view = QPlainTextEdit(error or "")
-        self.error_view.setReadOnly(True)
-        self.error_view.setFont(self.code_view.font())
-        self.error_view.setMaximumHeight(150)
-        self.error_view.setVisible(bool(error))
-        layout.addWidget(self.error_view)
+        self.error_view = None
+        if error:
+            self.error_view = QTextEdit()
+            self.error_view.setAcceptRichText(False)
+            self.error_view.setReadOnly(True)
+            self.error_view.setFont(Theme.mono(10.5))
+            self.error_view.setFrameShape(QFrame.Shape.NoFrame)
+            self.error_view.setLineWrapMode(QTextEdit.LineWrapMode.FixedPixelWidth)
+            self.error_view.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self.error_view.document().setDocumentMargin(0)
+            self.error_view.setPlainText(error)
+            self.error_view.setAccessibleName("Python plot error")
+            layout.addWidget(self.error_view)
+
         foot = QHBoxLayout()
-        self.python_label = QLabel()
-        self.python_label.setWordWrap(True)
+        self.python_label = _PlotPythonLabel()
         foot.addWidget(self.python_label, 1)
-        change = QPushButton("Change Python…")
+        change = QPushButton("Change…")
         change.clicked.connect(self.choose_python)
         foot.addWidget(change)
-        automatic = QPushButton("Automatic")
-        automatic.clicked.connect(self.automatic_python)
-        foot.addWidget(automatic)
+        self.automatic = QPushButton("Automatic")
+        self.automatic.clicked.connect(self.automatic_python)
+        foot.addWidget(self.automatic)
+        foot.addSpacing(8)
         cancel = QPushButton("Cancel")
         cancel.clicked.connect(self.cancel_pressed)
         foot.addWidget(cancel)
         render = QPushButton("Render")
+        render.setToolTip("Run the code now (Ctrl+Return)")
         render.clicked.connect(self.render_pressed)
         foot.addWidget(render)
         layout.addLayout(foot)
-        self.mode.currentIndexChanged.connect(self.mode_changed)
-        shortcut = QShortcut(QKeySequence("Ctrl+Return"), self)
-        shortcut.activated.connect(self.render_pressed)
+        self.mode.idClicked.connect(self.mode_changed)
+        QShortcut(QKeySequence("Ctrl+Return"), self, activated=self.render_pressed)
+        QShortcut(QKeySequence("Escape"), self, activated=self.cancel_pressed)
         self.mode_changed()
         self.update_python()
+        self._recolor()
+        watch_appearance(self._recolor)
 
     @property
     def spec(self):
-        return PlotSpec(file=self.file_field.text().strip()) if self.mode.currentIndex() else PlotSpec(code=self.code_view.toPlainText())
+        if self.mode.checkedId() == 1:
+            return PlotSpec(file=self.file_field.text().strip())
+        return PlotSpec(code=self.code_view.toPlainText())
+
+    @property
+    def python_path(self):
+        return str(self.settings.value("plotPython", "") or "")
+
+    def file_path(self, text):
+        return self.deck / Path(text).expanduser()
 
     def update_python(self):
-        value = str(self.settings.value("plotPython", "") or "")
-        self.python_label.setText("Python: " + (value or "automatic (one with matplotlib)"))
-        self.python_label.setToolTip(value)
+        value = self.python_path
+        self.python_label.set_path(value)
+        self.automatic.setVisible(bool(value))
+        self._place()
+
+    def _recolor(self):
+        def color(ink):
+            return ink.name(QColor.NameFormat.HexArgb)
+
+        self.python_label.setStyleSheet(f"color: {color(Theme.secondary_ink())}")
+        self.segments.setStyleSheet(f"""
+            #plotModes QPushButton {{
+                background: {color(Theme.ink(.06))};
+                border: 1px solid {color(Theme.separator())};
+                padding: 3px 10px;
+            }}
+            #plotModeCode {{ border-top-left-radius: 5px; border-bottom-left-radius: 5px; }}
+            #plotModeFile {{ border-top-right-radius: 5px; border-bottom-right-radius: 5px; border-left: 0; }}
+            #plotModes QPushButton:hover {{ background: {color(Theme.ink(.11))}; }}
+            #plotModes QPushButton:checked {{ background: {color(Theme.accent_soft)}; }}
+            #plotModes QPushButton:focus {{ border-color: {color(Theme.accent)}; }}
+        """)
+        if self.error_view is not None:
+            palette = self.error_view.palette()
+            palette.setColor(QPalette.ColorRole.Text, Theme.error_ink())
+            palette.setColor(QPalette.ColorRole.Base, self.palette().window().color())
+            self.error_view.setPalette(palette)
 
     def mode_changed(self):
-        self.code_view.setVisible(self.mode.currentIndex() == 0)
-        self.file_row.setVisible(self.mode.currentIndex() == 1)
+        file_mode = self.mode.checkedId() == 1
+        self.code_view.setVisible(not file_mode)
+        self.file_row.setVisible(file_mode)
+        self._place()
 
-    def _choose(self, title, filter="All files (*)"):
-        # A child file dialog must not count as clicking away from this popup.
-        self._choosing = True
+    def present(self, anchor: QRect, *, below=False):
+        self._anchor = anchor
+        self._below = below
+        screen = QGuiApplication.screenAt(anchor.center()) or self.parentWidget().screen()
+        self._available = screen.availableGeometry().adjusted(8, 8, -8, -8)
+        self.setFixedWidth(max(1, min(560, self._available.width())))
+        if self.error_view is not None:
+            error = self.error_view
+            gutter = error.verticalScrollBar().sizeHint().width()
+            wrap_width = max(1, min(520, self.width() - 24 - gutter))
+            error.setLineWrapColumnOrWidth(wrap_width)
+            error.document().setTextWidth(wrap_width)
+            error.setFixedHeight(min(140, round(error.document().size().height()) + 4))
+        self._place()
+        self.show()
+        (self.file_field if self.mode.checkedId() == 1 else self.code_view).setFocus()
+
+    def _place(self):
+        if self._anchor is None:
+            return
+        available, anchor = self._available, self._anchor
+        layout = self.layout()
+        layout.activate()
+        width = self.width()
+        height = layout.totalHeightForWidth(width) if layout.hasHeightForWidth() else layout.sizeHint().height()
+        self.resize(width, height)
+        if self._below:
+            x, y = anchor.center().x() - width // 2, anchor.bottom() + 8
+            if y + height > available.bottom():
+                y = anchor.top() - height - 8
+        else:
+            x, y = anchor.right() + 8, anchor.center().y() - height // 2
+            if x + width > available.right() and anchor.left() - width - 8 >= available.left():
+                x = anchor.left() - width - 8
+        self.move(max(available.left(), min(x, available.right() - width + 1)),
+                  max(available.top(), min(y, available.bottom() - height + 1)))
+
+    def _choose(self, title, path, name_filter="All files (*)", *, hidden=False):
+        start = path.parent if path is not None and path.parent.is_dir() else self.deck
+        dialog = QFileDialog(self, title, str(start), name_filter)
+        self._chooser = dialog
+        dialog.setOption(QFileDialog.Option.DontResolveSymlinks)
+        dialog.setFileMode(QFileDialog.FileMode.ExistingFile)
+        dialog.setSupportedSchemes(["file"])
+        if hidden:
+            dialog.setFilter(dialog.filter() | QDir.Filter.Hidden)
+        if path is not None and start == path.parent:
+            dialog.selectFile(path.name)
         try:
-            return QFileDialog.getOpenFileName(self, title, str(self.deck), filter)[0]
+            return dialog.selectedFiles()[0] if dialog.exec() else ""
         finally:
-            self._choosing = False
-            self.show()
+            dialog.deleteLater()
+            self._chooser = None
+            if self._cancelled:
+                self._deliver()
+            elif not self.isVisible():
+                self.show()
 
     def choose_file(self):
-        path = self._choose("Choose a Python file that draws the plot", "Python (*.py)")
-        if path:
+        text = self.file_field.text().strip()
+        path = self._choose("Choose a Python file that draws the plot",
+                            self.file_path(text) if text else None, "Python (*.py)")
+        if path and not self._delivered:
             self.file_field.setText(path)
 
     def choose_python(self):
-        path = self._choose("Choose Python with matplotlib")
-        if path:
+        saved = self.python_path
+        path = self._choose("Choose the Python that runs plots (a python3 with matplotlib)",
+                            Path(saved).expanduser() if saved else None, hidden=True)
+        if path and not self._delivered:
             self.settings.setValue("plotPython", path)
             self.update_python()
 
@@ -416,10 +583,14 @@ class PlotEditor(QFrame):
         self.update_python()
 
     def cancel_pressed(self):
-        self.cancelled = True
+        self._cancelled = True
+        if self._chooser is not None:
+            self._chooser.reject()
         self.close()
+        self._deliver()
 
     def render_pressed(self):
+        self.render_requested = True
         self.close()
 
     def keyPressEvent(self, event):
@@ -431,11 +602,21 @@ class PlotEditor(QFrame):
 
     def hideEvent(self, event):
         super().hideEvent(event)
-        if not self._choosing and not self._delivered:
-            self._delivered = True
-            callback = self.on_cancel if self.cancelled else self.on_done
-            if callback:
-                callback() if self.cancelled else callback(self.spec)
+        if self._chooser is None:
+            self._deliver()
+
+    def _deliver(self):
+        if self._delivered or self._chooser is not None:
+            return
+        self._delivered = True
+        done, cancel = self.on_done, self.on_cancel
+        self.on_done = self.on_cancel = None
+        if self._cancelled:
+            if cancel:
+                cancel()
+        elif done:
+            done(self.spec)
+        self.deleteLater()
 
 
 class PlotMixin:
@@ -448,9 +629,13 @@ class PlotMixin:
             path = self.work_deck / obj["image"]
         return PythonPlot.plot(path) if path else None
 
-    def insert_python_plot_pressed(self):
+    def insert_python_plot_pressed(self, anchor=None):
         if self.scene_name and self.workspace:
-            return self.open_plot_editor(PlotSpec(code=PythonPlot.template), None, None)
+            if anchor is None:
+                button = getattr(self, "_toolbar_buttons", {}).get("insert_python_plot_pressed")
+                if button is not None and button.isVisible() and button.isEnabled():
+                    anchor = button
+            return self.open_plot_editor(PlotSpec(code=PythonPlot.template), anchor=anchor)
 
     def edit_plot(self, oid):
         return spawn(self._load_plot(oid, False), "Edit plot").future
@@ -459,29 +644,64 @@ class PlotMixin:
         return spawn(self._load_plot(oid, True), "Rerun plot").future
 
     def _load_plot(self, oid, rerun):
+        ws, name = self.workspace, self.scene_name
         location = self.plot_of(oid)
         if location:
             try:
                 spec = yield run_blocking(PythonPlot.load, *location)
+                if self.workspace is not ws or self.scene_name != name or self.plot_of(oid) != location:
+                    return
                 if rerun:
                     return (yield self.commit_plot(spec, oid, True))
                 return self.open_plot_editor(spec, oid, None)
             except Exception as exc:
                 self.toast(str(exc), error=True)
 
-    def open_plot_editor(self, spec, oid=None, error=None):
-        if not self.workspace:
+    def _plot_anchor(self, oid, control):
+        if isinstance(control, QWidget):
+            return QRect(control.mapToGlobal(QPoint()), control.size()), True
+        if isinstance(control, QRect) and not control.isEmpty():
+            return control, True
+        viewport = self.canvas.viewport()
+        box = self.canvas.current_box(oid) if oid is not None else None
+        if box is not None:
+            visible = self.canvas.view_rect(box).intersected(QRectF(viewport.rect()))
+            if not visible.isEmpty():
+                rect = visible.toAlignedRect()
+                return QRect(viewport.mapToGlobal(rect.topLeft()), rect.size()), False
+        mid = viewport.mapToGlobal(viewport.rect().center())
+        return QRect(mid.x() - 1, mid.y() - 1, 2, 2), False
+
+    def open_plot_editor(self, spec, oid=None, error=None, *, anchor=None):
+        ws, name = self.workspace, self.scene_name
+        if not ws or not name:
             return None
         previous = getattr(self, "_plot_editor", None)
-        if previous:
+        if previous is not None:
             previous.cancel_pressed()
         editor = PlotEditor(spec, error, self.work_deck, self.settings, self.window)
         self._plot_editor = editor
-        editor.on_done = lambda draft: self.commit_plot(draft, oid, False) if draft.file or (draft.code or "").strip() else None
-        center = self.canvas.mapToGlobal(self.canvas.rect().center())
-        editor.move(center.x() - editor.width() // 2, center.y() - editor.height() // 2)
-        editor.show()
-        (editor.file_field if spec.file else editor.code_view).setFocus()
+        initial_spec, initial_python = editor.spec, editor.python_path
+
+        def release():
+            if self._plot_editor is editor:
+                self._plot_editor = None
+
+        def finish(draft):
+            release()
+            if self.workspace is not ws or self.scene_name != name or not self.window.isVisible():
+                return
+            if not (draft.file or (draft.code or "").strip()):
+                return
+            # Opening or changing Python in a diagnostic is not permission to retry its code.
+            force = editor.render_requested and (error is not None or editor.python_path != initial_python)
+            if draft != initial_spec or force or (oid is None and error is None):
+                self.commit_plot(draft, oid, force)
+
+        editor.on_cancel = release
+        editor.on_done = finish
+        rect, below = self._plot_anchor(oid, anchor)
+        editor.present(rect, below=below)
         return editor
 
     def cancel_plot(self):
@@ -489,6 +709,9 @@ class PlotMixin:
         run = getattr(self, "_plot_run", None)
         if run:
             run.cancel()
+        install = getattr(self, "_plot_install", None)
+        if install:
+            install.cancel()
 
     def commit_plot(self, spec: PlotSpec, oid=None, force=False):
         if not self.workspace or not self.scene_name:
@@ -512,24 +735,30 @@ class PlotMixin:
             return
         if old and not force and (yield run_blocking(PythonPlot.load, *old)) == spec:
             return {"ok": True, "unchanged": True}
-        self.busy += 1
+        stage = "run"
         self.busy_text = "Running the plot's code…"
+        self.busy += 1
         self._plot_run = PythonPlot.run(spec, ws.work, self.runtime, self.settings)
         try:
             png = yield self._plot_run.start()
             if self.workspace is not ws:
                 return
+            self.busy_text = "Rendering…"
+            stage = "save"
             dir, stem = old if old else (ws.work, (yield run_blocking(PythonPlot.free_stem, ws.work)))
             file = yield run_blocking(PythonPlot.store, png, stem, dir)
             self._plot_run.check_cancelled()
             if self.workspace is not ws:
                 return
+            yield run_blocking(PythonPlot.save, spec, dir, stem)
+            if self.workspace is not ws:
+                return
             path = dir / file
             relative = os.path.relpath(path, ws.work)
             if old_image and Path(old_image).absolute() == path.absolute():
-                yield run_blocking(PythonPlot.save, spec, dir, stem)
                 self.toast("The plot is up to date")
                 return {"ok": True, "unchanged": True}
+            stage = "update"
             req = {"scene": name, "stop": context.stop, "items": []}
             if context.seen:
                 req["seen"] = context.seen
@@ -549,54 +778,82 @@ class PlotMixin:
                                  "ex": (width + w) / 2, "ey": (height + h) / 2}]
             result = yield self.call("insert_many", req)
             if not result.get("ok"):
-                raise RunError(result.get("error", "Could not update the plot"))
-            yield run_blocking(PythonPlot.save, spec, dir, stem)
+                self.toast(result.get("error") or "could not update the plot", error=True)
+                return result
             if self.workspace is ws:
                 if self.scene_name == name:
                     yield from self.load_scene(name, keep_stop=True)
                 yield from self.reload_state()
-                self.toast("Plot updated · Ctrl+Z goes back to the old one")
+                self.toast("Inserted image" if oid is None else "Plot updated · Ctrl+Z goes back to the old one")
             return result
-        except CancelledError:
-            if self.workspace is ws and self.scene_name == name:
-                self.open_plot_editor(spec, oid, "Plot cancelled; the previous picture is unchanged.")
         except Exception as exc:
-            self.toast("The plot's code failed", error=True)
-            if self.workspace is ws and self.scene_name == name:
-                if isinstance(exc, RunError) and exc.no_seaborn:
-                    self.offer_seaborn(exc.python, spec, oid)
-                else:
-                    self.open_plot_editor(spec, oid, str(exc))
+            failure = exc
         finally:
             self._plot_run = None
-            self.busy -= 1
             self.busy_text = "Rendering…"
+            self.busy -= 1
+        if self.workspace is not ws:
+            return
+        same_scene = self.scene_name == name
+        if isinstance(failure, CancelledError):
+            if same_scene:
+                self.open_plot_editor(spec, oid, "Plot cancelled; the previous picture is unchanged.")
+        elif stage == "run":
+            if isinstance(failure, RunError) and failure.no_seaborn and same_scene:
+                self.offer_seaborn(failure, spec, oid)
+            else:
+                self.toast("The plot's code failed", error=True)
+                if same_scene:
+                    self.open_plot_editor(spec, oid, str(failure))
+        elif stage == "save":
+            self.alert("Could not save the plot", str(failure))
+        else:
+            self.toast(str(failure) or "could not update the plot", error=True)
 
-    def offer_seaborn(self, python, spec, oid=None):
+    def offer_seaborn(self, error, spec, oid=None):
+        ws, name = self.workspace, self.scene_name
+        python = error.python
         dialog = QMessageBox(self.window)
         dialog.setWindowTitle("Seaborn isn't installed")
-        dialog.setText(f"This plot uses seaborn, missing from:\n{python}\n\nInstall it there using python -m pip install seaborn? This downloads packages and changes that Python environment.")
+        dialog.setTextFormat(Qt.TextFormat.PlainText)
+        dialog.setText("Seaborn isn't installed")
+        dialog.setInformativeText(f"This plot uses seaborn, which the Python that runs plots doesn't have:\n{python}\n\n"
+                                  "Manimble can install it there with “pip install seaborn” and then run the plot again. "
+                                  "This downloads packages and changes that Python environment.")
         install = dialog.addButton("Install Seaborn", QMessageBox.ButtonRole.AcceptRole)
         close = dialog.addButton("Close", QMessageBox.ButtonRole.RejectRole)
         dialog.setDefaultButton(close)
+        dialog.setEscapeButton(close)
+        add_copy_button(dialog)
         dialog.exec()
+        if self.workspace is not ws or self.scene_name != name:
+            return
         if dialog.clickedButton() is not install:
-            return self.open_plot_editor(spec, oid, f"ModuleNotFoundError: No module named 'seaborn'\n\nInstall seaborn into {python}, or choose another Python.")
+            return self.open_plot_editor(spec, oid, f"{error}\n\nInstall seaborn into {python}, or choose another Python below.")
         return spawn(self._install_seaborn(python, spec, oid), "Install seaborn").future
 
     def _install_seaborn(self, python, spec, oid):
-        self.busy += 1
         self.busy_text = "Installing seaborn…"
+        self.busy += 1
         ws, name = self.workspace, self.scene_name
-        command = PythonPlot.install_seaborn(python, self.runtime)
         try:
-            yield command.future
+            self._plot_install = PythonPlot.install_seaborn(python, self.runtime)
+            yield self._plot_install.future
         except Exception as exc:
-            if self.workspace is ws and self.scene_name == name:
-                self.open_plot_editor(spec, oid, "pip install seaborn failed:\n" + str(exc))
+            failure = exc
         else:
-            if self.workspace is ws and self.scene_name == name:
-                self.commit_plot(spec, oid, True)
+            failure = None
         finally:
-            self.busy -= 1
+            self._plot_install = None
             self.busy_text = "Rendering…"
+            self.busy -= 1
+        if self.workspace is not ws or self.scene_name != name:
+            return
+        if isinstance(failure, CancelledError):
+            self.open_plot_editor(spec, oid, "Seaborn installation cancelled.")
+        elif failure is not None:
+            self.toast("Could not install seaborn", error=True)
+            self.open_plot_editor(spec, oid, "pip install seaborn failed:\n" + str(failure))
+        else:
+            self.toast("Seaborn installed")
+            self.commit_plot(spec, oid, True)

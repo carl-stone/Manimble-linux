@@ -15,20 +15,47 @@ import shlex
 import sys
 
 from PySide6.QtCore import QObject, QProcess, QProcessEnvironment, Qt, QTimer, QUrl, Signal, Slot
+from PySide6.QtGui import QFont, QPalette
 from PySide6.QtWebChannel import QWebChannel
 from PySide6.QtWebEngineCore import (QWebEnginePage, QWebEngineProfile,
                                     QWebEngineSettings, QWebEngineUrlRequestInterceptor)
 from PySide6.QtWebEngineWidgets import QWebEngineView
-from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFontComboBox,
-                               QHBoxLayout, QInputDialog, QLabel, QLineEdit, QMessageBox,
-                               QPushButton, QSpinBox, QSplitter, QStackedWidget,
-                               QTabBar, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QDialog, QDialogButtonBox,
+                               QFontComboBox, QFormLayout, QHBoxLayout, QInputDialog, QLabel,
+                               QLineEdit, QMenu, QMessageBox, QPushButton, QSpinBox, QSplitter,
+                               QStackedWidget, QToolButton, QVBoxLayout, QWidget)
 
 from . import prefs
+from .drawer import DrawerIconButton
 from .paths import RESOURCES
-from .pty_helper import login_shell
+from .pty_helper import login_shell, terminal_directory
+from .style import Theme, is_dark, watch_appearance
+from .widgets import add_copy_button
 
 _RESOURCE_DIR = (RESOURCES / "terminal").resolve()
+
+# Swift specifies the default ink and paper; its terminal renderer supplies these ANSI roles.
+_ANSI_NAMES = (
+    "black", "red", "green", "yellow", "blue", "magenta", "cyan", "white",
+    "brightBlack", "brightRed", "brightGreen", "brightYellow", "brightBlue",
+    "brightMagenta", "brightCyan", "brightWhite",
+)
+_ANSI_LIGHT = (
+    "#242424", "#a12430", "#28610d", "#755900", "#17569c", "#873887", "#0b656b", "#dedede",
+    "#5f5f5f", "#bf303f", "#367621", "#866800", "#1b65b5", "#9e439e", "#12757d", "#ffffff",
+)
+_ANSI_DARK = (
+    "#242424", "#ef767d", "#91c776", "#d9b968", "#79b2f8", "#d79ed9", "#73c9cf", "#cccccc",
+    "#808080", "#ff9aa1", "#ade38f", "#f3d58b", "#a2caff", "#f1b7f1", "#92e2e9", "#ffffff",
+)
+
+
+def _saved_font_family() -> str:
+    return prefs.get_str("terminal.font", Theme.mono(12).family())
+
+
+def _saved_font_size() -> int | None:
+    return prefs.get_int("terminal.fontSize") or None
 
 
 def _local_url(url: QUrl) -> bool:
@@ -76,11 +103,11 @@ class _Bridge(QObject):
     def ready(self):
         session = self.session
         session.page_ready = True
-        session._send_font()
+        session._send_appearance()
         for data in session._pending_output:
             session._emit("write", data=data)
         session._pending_output.clear()
-        if session._focus_pending:
+        if session._focus_pending and session.isVisible():
             session.focus()
 
     @Slot(str)
@@ -102,8 +129,9 @@ class _Bridge(QObject):
 
     @Slot(str)
     def title_changed(self, title):
-        self.session.shell_title = title
-        self.session._title_changed()
+        if title and title != self.session.shell_title:
+            self.session.shell_title = title
+            self.session._title_changed()
 
     @Slot(str)
     def snapshot(self, text):
@@ -129,7 +157,7 @@ class _Bridge(QObject):
         elif action == "zoom_out":
             session.set_font(size=max(7, session.font_size - 1))
         elif action == "zoom_reset":
-            session.set_font(size=13)
+            session.reset_font_size()
 
 
 class TerminalSession(QWidget):
@@ -150,11 +178,10 @@ class TerminalSession(QWidget):
         self.original: Path | None = None
         self.on_title = None
         self.shell_title = ""
-        self.foreground_command: str | None = None
         self.commands: list[str] = []
         self.columns, self.rows = 80, 24
-        self.font_family = prefs.get_str("terminal.font", "monospace")
-        self.font_size = prefs.get_int("terminal.fontSize", 13)
+        self.font_family = _saved_font_family()
+        self._font_size = _saved_font_size()
         self.page_ready = False
         self._focus_pending = False
         self._pending_output: list[str] = []
@@ -170,14 +197,14 @@ class TerminalSession(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
         self.marker = QWidget(self)
-        self.marker.setFixedHeight(2)
-        self.marker.setStyleSheet("background: #70a5eb")
+        self.marker.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.marker.setStyleSheet(f"background: {Theme.accent.name()}")
         self.marker.hide()
-        layout.addWidget(self.marker)
         self.error_label = QLabel(self)
         self.error_label.setWordWrap(True)
         self.error_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.error_label.setStyleSheet("color: #ffb5ab; background: #282022; padding: 5px")
+        self.error_label.setTextFormat(Qt.TextFormat.PlainText)
+        self.error_label.setFont(Theme.mono(10))
         self.error_label.hide()
         layout.addWidget(self.error_label)
         self.view = QWebEngineView(self)
@@ -210,6 +237,8 @@ class TerminalSession(QWidget):
         self.page.diagnostic.connect(self._error)
         self.page.renderProcessTerminated.connect(self._renderer_stopped)
         self.view.loadFinished.connect(self._loaded)
+        watch_appearance(self._send_appearance)
+        self._send_appearance()
         self.view.load(QUrl.fromLocalFile(str(_RESOURCE_DIR / "terminal.html")))
 
     @property
@@ -220,6 +249,13 @@ class TerminalSession(QWidget):
     def highlighted(self, value):
         self._highlighted = bool(value)
         self.marker.setVisible(self._highlighted)
+        if self._highlighted:
+            self.marker.setGeometry(0, 0, self.width(), 2)
+            self.marker.raise_()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.marker.setGeometry(0, 0, event.size().width(), 2)
 
     @property
     def process(self):
@@ -258,7 +294,6 @@ class TerminalSession(QWidget):
             return
         self._restart = None
         self.commands = []
-        self.foreground_command = None
         self.shell_title = ""
         self._buffer.clear()
         self._stderr.clear()
@@ -309,24 +344,25 @@ class TerminalSession(QWidget):
                 if event == "output":
                     data = base64.b64decode(message["data"], validate=True)
                     self.output.emit(data)
-                    if self.page_ready:
-                        self._emit("write", data=message["data"])
-                    else:
-                        self._pending_output.append(message["data"])
-                        # The renderer may fail; retain bounded diagnostics, not an unbounded shell log.
-                        if len(self._pending_output) > 256:
-                            del self._pending_output[0]
+                    self._write_screen(message["data"])
                 elif event == "status":
-                    self.foreground_command = message.get("foreground")
                     self.commands = message.get("commands", [])
-                    self._title_changed()
                 elif event == "error":
                     self._error(message["message"])
                 elif event == "exit":
-                    self._emit("write", data=base64.b64encode(
-                        f"\r\n[process finished ({message['code']}) — Restart starts a new shell]\r\n".encode()).decode())
+                    self._write_screen(base64.b64encode(
+                        "\r\n[process finished — press ↻ to start a new shell]\r\n".encode()).decode())
             except (ValueError, KeyError, TypeError) as exc:
                 self._error(f"Invalid terminal helper reply: {exc}")
+
+    def _write_screen(self, data):
+        if self.page_ready:
+            self._emit("write", data=data)
+        else:
+            self._pending_output.append(data)
+            # Keep bounded diagnostics even when the renderer fails.
+            if len(self._pending_output) > 256:
+                del self._pending_output[0]
 
     def _finished(self, process, code):
         if process is not self._process:
@@ -334,7 +370,6 @@ class TerminalSession(QWidget):
         self._read_output(process)
         self._read_errors(process)
         self.commands = []
-        self.foreground_command = None
         self._process = None
         process.deleteLater()
         if self._stop_future is not None and not self._stop_future.done():
@@ -385,18 +420,46 @@ class TerminalSession(QWidget):
         if self.on_title:
             self.on_title()
 
-    def _send_font(self):
+    @Slot()
+    def _send_appearance(self):
+        background = Theme.code_background()
+        self.error_label.setStyleSheet(
+            f"color: {Theme.error_ink().name()}; background: {background.name()}; padding: 5px")
+        self.page.setBackgroundColor(background)
         if self.page_ready:
-            self._emit("font", family=self.font_family, size=self.font_size)
+            dark = is_dark()
+            foreground = "#e6e6e6" if dark else "#1f1f1f"
+            paper = background.name()
+            theme = dict(zip(_ANSI_NAMES, _ANSI_DARK if dark else _ANSI_LIGHT))
+            theme.update(
+                background=paper, foreground=foreground,
+                cursor=foreground, cursorAccent=paper,
+                selectionBackground=Theme.warm.name() + ("5c" if dark else "3d"),
+                selectionInactiveBackground="#ffffff24" if dark else "#0000001f",
+            )
+            self._send_settings(theme=theme, scheme="dark" if dark else "light")
+
+    @property
+    def font_size(self) -> float:
+        return self._font_size if self._font_size is not None else Theme.logical_size(12)
+
+    def _send_settings(self, **appearance):
+        if self.page_ready:
+            self._emit("settings", family=self.font_family, size=self.font_size, **appearance)
 
     def set_font(self, family: str | None = None, size: int | None = None):
         if family is not None:
             self.font_family = family
             prefs.set("terminal.font", family)
         if size is not None:
-            self.font_size = max(7, min(40, int(size)))
-            prefs.set("terminal.fontSize", self.font_size)
-        self._send_font()
+            self._font_size = max(7, min(40, int(size)))
+            prefs.set("terminal.fontSize", self._font_size)
+        self._send_settings()
+
+    def reset_font_size(self):
+        self._font_size = None
+        prefs.remove("terminal.fontSize")
+        self._send_settings()
 
 
 @dataclass
@@ -425,10 +488,11 @@ class TerminalPanel(QWidget):
     """Tabs of splittable shells; ``start(work, original)`` sets both deck directories.
 
     ``environment`` and ``python`` may be set by the controller before start.
-    ``on_hide``/``on_change`` are ordinary callable hooks, matching TerminalPanel.swift.
+    ``tabs_changed`` reports shell titles and changes to the active tab.
     """
     output = Signal(bytes)
     diagnostic = Signal(str)
+    tabs_changed = Signal()
 
     def __init__(self, controller=None, parent=None, *, python=None, environment=None):
         super().__init__(parent)
@@ -436,63 +500,70 @@ class TerminalPanel(QWidget):
         self.python = str(python or sys.executable)
         self.environment = dict(environment if environment is not None else os.environ)
         self.directory = Path.home()
+        self._has_workspace = False
         self.original: Path | None = None
         self.tabs: list[_TerminalTab] = []
         self.active_tab: _TerminalTab | None = None
         self.active: TerminalSession | None = None
-        self.on_hide = None
-        self.on_change = None
         self.installed: set[str] | None = None
         self._probes: list[QProcess] = []
         self._closing: set[TerminalSession] = set()
+        self.setAutoFillBackground(True)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
-        self.actions = QWidget(self)
+        self.actions = QWidget(self)      # BottomDrawer places this in its header.
         toolbar = QHBoxLayout(self.actions)
-        toolbar.setContentsMargins(4, 2, 4, 2)
-        self.agent_chooser = QComboBox(self.actions)
-        for agent in AI_AGENTS:
-            self.agent_chooser.addItem(agent.title, agent.command)
-        self.agent_chooser.addItem("Custom command…", "custom")
-        toolbar.addWidget(self.agent_chooser)
-        self.run_button = QPushButton(self.actions)
+        toolbar.setContentsMargins(0, 0, 0, 0)
+        toolbar.setSpacing(10)
+        run_group = QWidget(self.actions)
+        run_row = QHBoxLayout(run_group)
+        run_row.setContentsMargins(0, 0, 0, 0)
+        run_row.setSpacing(2)
+        self.run_button = QToolButton(run_group)
+        self.run_button.setFont(Theme.font(11, QFont.Weight.Medium))
+        self.run_button.setAutoRaise(True)
+        self.run_button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
         self.run_button.clicked.connect(self.run_agent)
-        toolbar.addWidget(self.run_button)
-        self.agent_chooser.activated.connect(self.choose_agent)
-        for label, slot in (("+ Tab", self.add_tab), ("Split", self.split_active),
-                            ("Restart", self.restart_pressed), ("Close", self.kill_pressed),
-                            ("Find", self.show_find)):
-            button = QPushButton(label, self.actions)
-            button.clicked.connect(slot)
-            toolbar.addWidget(button)
-        self.location = QComboBox(self.actions)
-        self.location.addItems(["Working copy", "Original folder"])
-        self.location.setCurrentIndex(0 if prefs.get_bool("terminalInWorkCopy", True) else 1)
-        self.location.activated.connect(self._change_location)
+        run_row.addWidget(self.run_button)
+        menu_button_style = "QToolButton::menu-indicator { image: none; width: 0; }"
+        chooser = DrawerIconButton("chevron.down", "Choose the AI coding agent", run_group, size=9, width=16)
+        self.agent_menu = QMenu(chooser)
+        self.agent_menu.aboutToShow.connect(self._update_agent_menu)
+        chooser.setMenu(self.agent_menu)
+        chooser.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        chooser.setStyleSheet(menu_button_style)
+        run_row.addWidget(chooser)
+        toolbar.addWidget(run_group)
+        self.split_button = DrawerIconButton("square.split.2x1", "Split terminal (Ctrl+\\)", self.actions)
+        self.split_button.clicked.connect(self.split_active)
+        toolbar.addWidget(self.split_button)
+        restart = DrawerIconButton("arrow.clockwise", "Restart shell", self.actions)
+        restart.clicked.connect(self.restart_pressed)
+        toolbar.addWidget(restart)
+        kill = DrawerIconButton("trash", "Kill terminal", self.actions)
+        kill.clicked.connect(self.kill_pressed)
+        toolbar.addWidget(kill)
+        self.location = QToolButton(self.actions)
+        self.location.setFont(Theme.font(11))
+        self.location.setAutoRaise(True)
+        self.location.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.location.setAccessibleName("Terminal working directory")
+        self.location.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        self.location.setStyleSheet(menu_button_style)
+        self.location_menu = QMenu(self.location)
+        self.location_menu.aboutToShow.connect(self._update_location_menu)
+        self.location.setMenu(self.location_menu)
         toolbar.addWidget(self.location)
-        self.font = QFontComboBox(self.actions)
-        self.font.setFontFilters(QFontComboBox.FontFilter.MonospacedFonts)
-        self.font.setMaximumWidth(140)
-        self.font.setCurrentText(prefs.get_str("terminal.font", "monospace"))
-        self.font.currentFontChanged.connect(lambda font: self.set_font(font.family()))
-        toolbar.addWidget(self.font)
-        self.size = QSpinBox(self.actions)
-        self.size.setRange(7, 40)
-        self.size.setValue(prefs.get_int("terminal.fontSize", 13))
-        self.size.valueChanged.connect(lambda size: self.set_font(size=size))
-        toolbar.addWidget(self.size)
-        toolbar.addStretch(1)
-        hide = QPushButton("Hide", self.actions)
-        hide.clicked.connect(self.hide_terminal)
-        toolbar.addWidget(hide)
-        layout.addWidget(self.actions)
-        self.tab_bar = QTabBar(self)
-        self.tab_bar.setExpanding(False)
-        self.tab_bar.setTabsClosable(True)
-        self.tab_bar.currentChanged.connect(self.select_tab)
-        self.tab_bar.tabCloseRequested.connect(self.close_tab)
-        layout.addWidget(self.tab_bar)
+        options = DrawerIconButton("ellipsis", "Terminal Options", self.actions)
+        options_menu = QMenu(options)
+        options_menu.addAction("Find…", self.show_find)
+        options_menu.addAction("Font and Size…", self.edit_font)
+        options.setMenu(options_menu)
+        options.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        options.setStyleSheet(menu_button_style)
+        toolbar.addWidget(options)
+        self.actions.hide()
         self.find_bar = QWidget(self)
         find_layout = QHBoxLayout(self.find_bar)
         find_layout.setContentsMargins(4, 0, 4, 0)
@@ -501,23 +572,27 @@ class TerminalPanel(QWidget):
         self.find_case = QCheckBox("Case", self.find_bar)
         find_layout.addWidget(self.find_field)
         find_layout.addWidget(self.find_case)
-        for label, slot in (("Previous", lambda: self.find(True)), ("Next", self.find),
+        for label, slot in (("Previous", lambda: self.find(True)), ("Next", lambda: self.find()),
                             ("Close", self.hide_find)):
             button = QPushButton(label, self.find_bar)
             button.clicked.connect(slot)
             find_layout.addWidget(button)
         self.find_field.returnPressed.connect(self.find)
         self.find_field.textChanged.connect(lambda: self.find())
+        self.find_case.toggled.connect(lambda: self.find())
         self.find_bar.hide()
         layout.addWidget(self.find_bar)
         self.content = QStackedWidget(self)
         layout.addWidget(self.content, 1)
         self.warning = QLabel(self)
         self.warning.setWordWrap(True)
-        self.warning.setStyleSheet("color: #e8bd70; padding: 3px")
+        self.warning.setTextFormat(Qt.TextFormat.PlainText)
+        self.warning.setFont(Theme.font(10))
         layout.addWidget(self.warning)
         self.update_run_button()
         self._update_warning()
+        watch_appearance(self._refresh_appearance)
+        self._refresh_appearance()
         # WebEngine's actual text focus lives in its internal widget. JS focus/blur
         # alone does not cover switching to another Qt window or a find field.
         QApplication.instance().focusChanged.connect(self._qt_focus_changed)
@@ -529,8 +604,8 @@ class TerminalPanel(QWidget):
     @property
     def tab_titles(self):
         return [(f"Terminal {tab.number}" + (f" ×{len(tab.sessions)}" if len(tab.sessions) > 1 else ""),
-                 " · ".join(session.foreground_command or session.shell_title for session in tab.sessions
-                            if session.foreground_command or session.shell_title)) for tab in self.tabs]
+                 "  ·  ".join(session.shell_title for session in tab.sessions if session.shell_title))
+                for tab in self.tabs]
 
     @property
     def active_tab_index(self):
@@ -558,19 +633,41 @@ class TerminalPanel(QWidget):
         self.update_run_button()
 
     def update_run_button(self):
-        name = self.agent.split(maxsplit=1)[0] if self.agent else "agent"
-        self.run_button.setText(f"Run {name}")
-        self.run_button.setToolTip(f"Type `{self.agent}` and Enter into the active terminal")
-        index = self.agent_chooser.findData(self.agent)
-        self.agent_chooser.setCurrentIndex(index if index >= 0 else len(AI_AGENTS))
-        for item, agent in enumerate(AI_AGENTS):
-            suffix = " (not installed)" if self.installed is not None and agent.command not in self.installed else ""
-            self.agent_chooser.setItemText(item, agent.title + suffix)
-        custom = not any(agent.command == self.agent for agent in AI_AGENTS)
-        self.agent_chooser.setItemText(len(AI_AGENTS), f"Custom: {self.agent}…" if custom else "Custom command…")
+        command = self.agent
+        words = command.split(maxsplit=1)
+        name = words[0] if words else "agent"
+        title = f"Run {name}"
+        self.run_button.setText(self.run_button.fontMetrics().elidedText(title, Qt.TextElideMode.ElideRight, 132))
+        self.run_button.setAccessibleName(title)
+        self.run_button.setToolTip(f"Type `{command}` into the active terminal")
+
+    def _refresh_appearance(self):
+        paper = self.palette()
+        paper.setColor(QPalette.ColorRole.Window, Theme.code_background())
+        self.setPalette(paper)
+        palette = self.run_button.palette()
+        palette.setColor(QPalette.ColorGroup.Active, QPalette.ColorRole.ButtonText, Theme.accent)
+        palette.setColor(QPalette.ColorGroup.Inactive, QPalette.ColorRole.ButtonText, Theme.accent)
+        self.run_button.setPalette(palette)
+        self._refresh_warning_ink()
+
+    def _refresh_warning_ink(self):
+        palette = self.warning.palette()
+        palette.setColor(QPalette.ColorRole.WindowText,
+                         Theme.error_ink() if self.uses_repository else Theme.secondary_ink())
+        self.warning.setPalette(palette)
+        self.warning.setContentsMargins(6, 3, 6, 3)
+
+    @property
+    def starts_in_work_copy(self):
+        return prefs.get_bool("terminalInWorkCopy", True)
+
+    @property
+    def uses_repository(self):
+        return not self.starts_in_work_copy and self.original is not None
 
     def _cwd(self):
-        return self.original if self.location.currentIndex() == 1 and self.original else self.directory
+        return self.original if self.uses_repository else self.directory
 
     def _session_environment(self):
         env = dict(self.environment)
@@ -579,18 +676,33 @@ class TerminalPanel(QWidget):
             env["MANIMBLE_ORIGINAL_DECK"] = str(self.original)
         return env
 
+    def configure(self, directory: str | Path, original: str | Path | None = None):
+        """Set the next shell's workspace; earlier workspace shells must be stopped."""
+        directory = Path(directory).absolute()
+        original = Path(original).absolute() if original is not None else None
+        if (directory, original) != (self.directory, self.original):
+            if any(session.process is not None for session in self.all_sessions):
+                raise RuntimeError("Stop the previous workspace's terminals before changing their directory")
+            for tab in self.tabs:
+                self.content.removeWidget(tab.panes)
+                tab.panes.deleteLater()
+            self.tabs.clear()
+            self.active = self.active_tab = None
+            self.find_bar.hide()
+        self.directory, self.original = directory, original
+        self._has_workspace = True
+        self._update_warning()
+        self.refresh()
+
+    @property
+    def workspace_available(self):
+        return self._has_workspace
+
     def start(self, directory: str | Path, original: str | Path | None = None):
-        self.directory = Path(directory).absolute()
-        self.original = Path(original).absolute() if original is not None else None
+        self.configure(directory, original)
         if not self.tabs:
             self.add_tab()
             self.check_installed()
-        else:
-            for session in self.all_sessions:
-                session.environment = self._session_environment()
-                session.original_repository = self.location.currentIndex() == 1
-                session.start(self._cwd(), self.original)
-        self._update_warning()
 
     def add_tab(self):
         used = {tab.number for tab in self.tabs}
@@ -609,7 +721,7 @@ class TerminalPanel(QWidget):
 
     def add_session(self, tab):
         session = TerminalSession(tab.panes, python=self.python, environment=self._session_environment())
-        session.original_repository = self.location.currentIndex() == 1
+        session.original_repository = self.uses_repository
         session.on_title = self.refresh
         session.output.connect(self.output)
         session.diagnostic.connect(self.diagnostic)
@@ -636,22 +748,10 @@ class TerminalPanel(QWidget):
             session.focus()
 
     def refresh(self):
-        self.tab_bar.blockSignals(True)
-        while self.tab_bar.count() > len(self.tabs):
-            self.tab_bar.removeTab(self.tab_bar.count() - 1)
-        for i, (title, tip) in enumerate(self.tab_titles):
-            if i >= self.tab_bar.count():
-                self.tab_bar.addTab(title)
-            self.tab_bar.setTabText(i, title)
-            self.tab_bar.setTabToolTip(i, tip)
-        if self.active_tab_index is not None:
-            self.tab_bar.setCurrentIndex(self.active_tab_index)
-        self.tab_bar.blockSignals(False)
         for tab in self.tabs:
             for session in tab.sessions:
                 session.highlighted = len(tab.sessions) > 1 and session is self.active
-        if self.on_change:
-            self.on_change()
+        self.tabs_changed.emit()
 
     def select_tab(self, index):
         if 0 <= index < len(self.tabs):
@@ -669,14 +769,18 @@ class TerminalPanel(QWidget):
         # Native widget focus, not the delayed DOM event, decides the active pane.
         if focused and owns_focus and session.isVisible():
             self.activate(session)
-        self._set_terminal_focused(widget is not None and self.isAncestorOf(widget))
+        self._set_terminal_focused(self._owns_focus(widget))
 
     def _qt_focus_changed(self, old, new):
         focused_session = next((session for session in self.all_sessions
                                 if new is session.view or (new is not None and session.view.isAncestorOf(new))), None)
-        if focused_session:
+        if focused_session is not None and focused_session is not self.active:
             self.activate(focused_session)
-        self._set_terminal_focused(new is not None and (new is self or self.isAncestorOf(new)))
+        self._set_terminal_focused(self._owns_focus(new))
+
+    def _owns_focus(self, widget):
+        return widget is not None and (widget is self or self.isAncestorOf(widget) or
+                                       widget is self.actions or self.actions.isAncestorOf(widget))
 
     def running_commands(self) -> list[str]:
         """Includes stopped/background jobs, which also lose their working copy on close."""
@@ -712,6 +816,7 @@ class TerminalPanel(QWidget):
         box = QMessageBox(QMessageBox.Icon.Warning, action,
                           "These running or suspended commands will stop:\n\n" + "\n".join(commands),
                           QMessageBox.StandardButton.Cancel, self)
+        box.setTextFormat(Qt.TextFormat.PlainText)
         stop = box.addButton("Stop Commands", QMessageBox.ButtonRole.DestructiveRole)
         box.setDefaultButton(QMessageBox.StandardButton.Cancel)
         box.exec()
@@ -746,8 +851,8 @@ class TerminalPanel(QWidget):
             else:
                 self.active = None
                 self.active_tab = None
+                self.find_bar.hide()
                 self.refresh()
-                self.hide_terminal()
         else:
             self.refresh()
 
@@ -756,22 +861,19 @@ class TerminalPanel(QWidget):
             return
         sessions = list(self.tabs[index].sessions)
         if self._confirm_stop(sessions, "Close terminal tab?"):
-            for session in sessions:
+            for session in reversed(sessions):
                 self.kill(session, confirmed=True)
 
     def restart_pressed(self):
         if self.active and self._confirm_stop([self.active], "Restart shell?"):
             self.active.environment = self._session_environment()
-            self.active.original_repository = self.location.currentIndex() == 1
+            self.active.original_repository = self.uses_repository
             self.active.start(self._cwd(), self.original)
             self.active.focus()
 
     def kill_pressed(self):
         if self.active:
             self.kill(self.active)
-
-    def split_pressed(self):
-        self.split_active()
 
     def type(self, text):
         if self.active:
@@ -784,13 +886,9 @@ class TerminalPanel(QWidget):
         if self.active:
             self.active.focus()
 
-    def hide_terminal(self):
-        self.hide()
-        self._set_terminal_focused(False)
-        if self.on_hide:
-            self.on_hide()
-
     def hideEvent(self, event):
+        for session in self.all_sessions:
+            session._focus_pending = False
         self._set_terminal_focused(False)
         super().hideEvent(event)
 
@@ -810,63 +908,119 @@ class TerminalPanel(QWidget):
             self.active._emit("search", text=self.find_field.text(), previous=bool(previous),
                               caseSensitive=self.find_case.isChecked())
 
-    def set_font(self, family=None, size=None):
+    def edit_font(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Terminal Font")
+        form = QFormLayout(dialog)
+        font = QFontComboBox(dialog)
+        font.setFontFilters(QFontComboBox.FontFilter.MonospacedFonts)
+        family = self.active.font_family if self.active else _saved_font_family()
+        font.setCurrentFont(QFont(family))
+        original_family = font.currentFont().family()
+        form.addRow("Font", font)
+        size = QSpinBox(dialog)
+        size.setRange(7, 40)
+        saved = self.active._font_size if self.active else _saved_font_size()
+        size.setValue(saved if saved is not None else round(Theme.logical_size(12)))
+        form.addRow("Size", size)
+        use_default = QCheckBox("Use default size", dialog)
+        use_default.setChecked(saved is None)
+        use_default.toggled.connect(size.setDisabled)
+        size.setDisabled(use_default.isChecked())
+        form.addRow(use_default)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel, dialog)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        form.addRow(buttons)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        chosen = font.currentFont().family()
+        new_family = chosen if chosen != original_family else None
+        new_size = None if use_default.isChecked() else size.value()
         for session in self.all_sessions:
-            session.set_font(family, size)
+            if new_family is not None or new_size is not None:
+                session.set_font(new_family, new_size)
+            if new_size is None and session._font_size is not None:
+                session.reset_font_size()
+        self.focus()
 
     def _update_warning(self):
-        if self.location.currentIndex() == 1:
+        repository = self.uses_repository
+        name = "Original folder" if repository else "Working copy"
+        directory = terminal_directory(self._cwd(), repository)
+        self.location.setText(name)
+        location = f"{name} — starts in {directory}" if self._has_workspace else name
+        self.location.setToolTip(location)
+        self.location.setAccessibleDescription(location)
+        self._refresh_warning_ink()
+        if repository:
             self.warning.setText("Original-folder shell: commands bypass Save isolation and can change original files immediately.")
         else:
             self.warning.setText("Working-copy shell. Authored symlinks and external assets are not sandboxed; commands can modify their targets.")
 
-    def set_start_in_work_copy(self, enabled: bool):
-        """Change the shared preference through the same warning/stop-consent flow."""
-        index = 0 if enabled else 1
-        self.location.setCurrentIndex(index)
-        self._change_location(index)
+    def _update_location_menu(self):
+        self.location_menu.clear()
+        for title, work in (("Working copy", True), ("Original folder", False)):
+            action = self.location_menu.addAction(title)
+            action.setCheckable(True)
+            action.setChecked(work != self.uses_repository)
+            action.setEnabled(work or self.original is not None)
+            action.triggered.connect(lambda _=False, enabled=work: self.set_start_in_work_copy(enabled))
 
-    def _change_location(self, index):
-        old = 0 if prefs.get_bool("terminalInWorkCopy", True) else 1
-        if index == old:
+    def set_start_in_work_copy(self, enabled: bool):
+        """Do not switch directories or stop a shell without the existing consent."""
+        if enabled == self.starts_in_work_copy:
             return
-        if index == 1:
+        if not enabled:
             if self.original is None:
                 QMessageBox.warning(self, "No original folder", "Open a deck before using its original folder.")
-                self.location.setCurrentIndex(old)
                 return
+            directory = terminal_directory(self.original, True)
             answer = QMessageBox.warning(self, "Use original folder?",
-                "Commands will run in the original deck and bypass Save isolation. Changes are immediate and cannot be reverted by Manimble. All open shells will restart.",
+                f"Commands will start in {directory} and bypass Save isolation. Changes are immediate and cannot be reverted by Manimble. All open shells will restart.",
                 QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Cancel)
             if answer != QMessageBox.StandardButton.Ok:
-                self.location.setCurrentIndex(old)
                 return
         if not self._confirm_stop(self.all_sessions, "Restart terminals in another folder?"):
-            self.location.setCurrentIndex(old)
             return
-        prefs.set("terminalInWorkCopy", index == 0)
+        prefs.set("terminalInWorkCopy", enabled)
         self._update_warning()
         for session in self.all_sessions:
             session.environment = self._session_environment()
-            session.original_repository = self.location.currentIndex() == 1
+            session.original_repository = self.uses_repository
             session.start(self._cwd(), self.original)
+        if self.controller:
+            self.controller.toast("New terminals open in the working copy (what the slides show)" if enabled else
+                                  "New terminals open in the project repository")
+            self.controller.actions.refresh()
 
-    def choose_agent(self, index):
-        command = self.agent_chooser.itemData(index)
-        if command == "custom":
-            self.custom_agent()
-        else:
-            self.agent = command
-            self.check_installed()
+    def _update_agent_menu(self):
+        self.agent_menu.clear()
+        for agent in AI_AGENTS:
+            suffix = "  (not installed)" if self.installed is not None and agent.command not in self.installed else ""
+            action = self.agent_menu.addAction(agent.title + suffix)
+            action.setCheckable(True)
+            action.setChecked(self.agent == agent.command)
+            action.triggered.connect(lambda _=False, command=agent.command: self.choose_agent(command))
+        self.agent_menu.addSeparator()
+        custom = all(agent.command != self.agent for agent in AI_AGENTS)
+        title = f"Custom: {self.agent.replace('&', '&&')}…" if custom else "Custom Command…"
+        action = self.agent_menu.addAction(title, self.custom_agent)
+        action.setCheckable(True)
+        action.setChecked(custom)
+
+    def choose_agent(self, command):
+        self.agent = command            # Run remains a separate, explicit action.
 
     def custom_agent(self):
-        text, accepted = QInputDialog.getText(self, "Custom agent command",
-            "The Run button types this command and Enter into the active shell.", text=self.agent)
-        if accepted and text.strip():
-            self.agent = text.strip()
+        dialog = QInputDialog(self)
+        dialog.setWindowTitle("Custom agent command")
+        dialog.setLabelText("Typed into the active terminal by the Run button, e.g. `aider` or `claude --model opus`.")
+        dialog.setTextValue(self.agent)
+        dialog.setOkButtonText("Use")
+        if dialog.exec() == QDialog.DialogCode.Accepted and (text := dialog.textValue().strip()):
+            self.agent = text
             self.check_installed()
-        else:
-            self.update_run_button()
 
     def check_installed(self, then=None):
         """Probe the interactive login shell, shell-quoting only executable names."""
@@ -928,10 +1082,11 @@ class TerminalPanel(QWidget):
         timer.start(5000)
 
     def run_agent(self):
-        if self.active is None:
-            self.add_tab()
-        command = self.agent
         target = self.active
+        if target is None or target.process is None:
+            return
+        process = target.process
+        command = self.agent
         try:
             parts = shlex.split(command)
         except ValueError as exc:
@@ -941,7 +1096,7 @@ class TerminalPanel(QWidget):
             return
         name = parts[0]
         def go(found):
-            if target not in self.all_sessions:
+            if target not in self.all_sessions or target.process is not process or target._stop_future is not None:
                 return
             if found is None:
                 QMessageBox.warning(self, "Cannot check agent availability",
@@ -953,18 +1108,25 @@ class TerminalPanel(QWidget):
                 target.focus()
         self.check_installed(then=go)
 
-    def offer_install(self, name, target=None):
-        target = target or self.active
+    def offer_install(self, name, target):
+        process = target.process
         agent = next((agent for agent in AI_AGENTS if agent.command == name), None)
-        if agent is None:
-            QMessageBox.information(self, "Agent not found", f"{name!r} was not found on your interactive login shell's PATH.")
-            return
-        box = QMessageBox(QMessageBox.Icon.Information, f"{agent.title} isn't installed",
-            f"Install it with:\n\n{agent.install}\n\nThen sign in the first time you run it. Type Install Command inserts text only; it does not execute or install anything.",
-            QMessageBox.StandardButton.Cancel, self)
-        insert = box.addButton("Type Install Command", QMessageBox.ButtonRole.ActionRole)
-        box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        title = f"{agent.title if agent else name} isn't installed"
+        box = QMessageBox(QMessageBox.Icon.Information, title, title,
+                          QMessageBox.StandardButton.Cancel if agent else QMessageBox.StandardButton.Ok, self)
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        insert = None
+        if agent:
+            box.setInformativeText(f"Install it with:\n\n{agent.install}\n\nthen sign in the first time you run it.")
+            insert = box.addButton("Type Install Command", QMessageBox.ButtonRole.ActionRole)
+            insert.setToolTip("Types the command without pressing Return")
+            box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        else:
+            box.setInformativeText(f"`{name}` wasn't found on your shell's PATH.")
+        copy = add_copy_button(box)
+        copy.setToolTip("Copy this message to the clipboard")
         box.exec()
-        if box.clickedButton() is insert and target in self.all_sessions:
+        if (agent is not None and box.clickedButton() is insert and target in self.all_sessions
+                and target.process is process and target._stop_future is None):
             target.type(agent.install)
             target.focus()

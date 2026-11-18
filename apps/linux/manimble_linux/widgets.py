@@ -1,31 +1,49 @@
 """Small Qt Widgets shared by the navigator, inspector, source pane and drawer."""
 from __future__ import annotations
 
-import math
 import time
+from math import ceil
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QRectF, QSize, QTimer
-from PySide6.QtGui import QColor, QPainter, QPen, QImage, QTextCursor, QTextCharFormat, QPalette
+from PySide6.QtCore import Qt, QRectF, QSize, QTimer, QVariantAnimation, Signal
+from PySide6.QtGui import (QColor, QFont, QFontMetrics, QFontMetricsF, QImage, QPainter, QPainterPath,
+                           QPalette, QPen, QRegion, QTextCharFormat, QTextCursor, QTextFormat)
 from PySide6.QtWidgets import (QApplication, QWidget, QFrame, QLabel, QPushButton, QToolButton,
     QVBoxLayout, QHBoxLayout, QPlainTextEdit, QTextEdit, QListWidget, QAbstractItemView,
-    QSplitter, QSplitterHandle, QMessageBox, QSizePolicy, QStyledItemDelegate, QStyle, QStyleOptionViewItem)
+    QSplitter, QSplitterHandle, QMessageBox, QSizePolicy, QStyledItemDelegate, QStyle, QStyleOptionViewItem,
+    QGraphicsOpacityEffect, QLayout)
 
 from . import prefs
-from .style import Theme
+from .icons import template_icon
+from .style import Theme, is_dark, watch_appearance
+
+
+def _set_chrome_style(widget, style):
+    # Repolishing a stylesheet can itself deliver a palette change.
+    if widget.styleSheet() != style:
+        widget.setStyleSheet(style)
+
+
+class _InkLabel(QLabel):
+    def __init__(self, text, ink, parent):
+        super().__init__(text, parent)
+        self._ink = ink
+        self._recolor()
+        watch_appearance(self._recolor)
+
+    def _recolor(self):
+        _set_chrome_style(self, f"color: {self._ink().name(QColor.NameFormat.HexArgb)}")
 
 
 def section_label(text, parent=None):
-    label = QLabel(text.upper(), parent)
-    label.setFont(Theme.font(10, Theme.font(10).Weight.DemiBold))
-    label.setStyleSheet(f"color: {Theme.ink(.45).name(QColor.NameFormat.HexArgb)}")
+    label = _InkLabel(text.upper(), Theme.tertiary_ink, parent)
+    label.setFont(Theme.font(10, QFont.Weight.DemiBold))
     return label
 
 
 def field_label(text, parent=None):
-    label = QLabel(text, parent)
+    label = _InkLabel(text, Theme.secondary_ink, parent)
     label.setFont(Theme.font(11))
-    label.setStyleSheet(f"color: {Theme.ink(.65).name(QColor.NameFormat.HexArgb)}")
     return label
 
 
@@ -86,6 +104,7 @@ class ProgressBar(QWidget):
         self._timer = QTimer(self)
         self._timer.setInterval(16)
         self._timer.timeout.connect(self._tick)
+        watch_appearance(self.update)
 
     @property
     def current(self):
@@ -146,56 +165,139 @@ class ProgressBar(QWidget):
         painter.drawRoundedRect(QRectF(0, 0, self.width() * self._current, self.height()), 1.5, 1.5)
 
 
-class Pill(QFrame):
+def _rounded_path(rect, radius):
+    path = QPainterPath()
+    path.addRoundedRect(rect, radius, radius)
+    return path
+
+
+def _rounded_mask(rect, radius):
+    return QRegion(_rounded_path(rect, radius).toFillPolygon().toPolygon())
+
+
+class Pill(QWidget):
+    contents_changed = Signal()
+    _radius = 15
+    _copy_tip = "Click to copy this message"
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.on_cancel = None
         self.default_estimate = 3.0
         self.hovered = False
+        self._shown = False
+        self._cancelling = False
+        self._symbol = self._tint = None
+
         self.label = QLabel(self)
+        self.label.setTextFormat(Qt.TextFormat.PlainText)
         self.label.setWordWrap(True)
-        self.label.setFont(Theme.font(12))
+        self.label.setAlignment(Qt.AlignmentFlag.AlignLeading | Qt.AlignmentFlag.AlignTop)
+        self.label.setFont(Theme.font(12, QFont.Weight.Medium))
         self.label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        self.icon = QToolButton(self)
-        self.icon.setText("ⓘ")
-        self.icon.setToolTip("Click to copy this message")
+        self.label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
+
+        self.icon = self._icon_button(13, self._copy_tip)
+        self.icon.setCursor(Qt.CursorShape.PointingHandCursor)
         self.icon.clicked.connect(self.copy_message)
-        self.cancel_button = QToolButton(self)
-        self.cancel_button.setText("×")
-        self.cancel_button.setAccessibleName("Stop rendering")
-        self.cancel_button.setToolTip("Stop rendering")
+        self.cancel_button = self._icon_button(14, "Stop rendering")
         self.cancel_button.clicked.connect(self.cancel_pressed)
-        self.cancel_button.hide()
         self.bar = ProgressBar(self)
-        self.bar.hide()
-        self.remaining_label = QLabel(self)
-        self.remaining_label.setFont(Theme.font(10))
-        self.remaining_label.hide()
+        for widget in (self.icon, self.cancel_button, self.bar):
+            widget.hide()
+
         row = QHBoxLayout()
         row.setSpacing(7)
         row.addWidget(self.icon)
         row.addWidget(self.label, 1)
-        row.addWidget(self.remaining_label)
         row.addWidget(self.cancel_button)
         layout = QVBoxLayout(self)
+        layout.setSizeConstraint(QLayout.SizeConstraint.SetNoConstraint)
         layout.setContentsMargins(12, 7, 14, 7)
         layout.setSpacing(6)
         layout.addLayout(row)
         layout.addWidget(self.bar)
-        self.setMaximumWidth(640)
-        self.setStyleSheet(f"Pill {{ background: {Theme.bar_background().name()}; border: 1px solid {Theme.ink(.14).name(QColor.NameFormat.HexArgb)}; border-radius: 15px; }} QToolButton {{ border: none; }}")
+        self._row = row
+
         self._copy_timer = QTimer(self)
         self._copy_timer.setSingleShot(True)
-        self._copy_timer.timeout.connect(lambda: self.icon.setText(self._symbol))
-        self._remaining_timer = QTimer(self)
-        self._remaining_timer.setInterval(250)
-        self._remaining_timer.timeout.connect(self._update_remaining)
-        self._symbol = "ⓘ"
-        self._deadline = None
+        self._copy_timer.timeout.connect(self._update_copy_icon)
+        self._opacity = QGraphicsOpacityEffect(self)
+        self._opacity.setOpacity(0.)
+        self.setGraphicsEffect(self._opacity)
+        self._fade = QVariantAnimation(self)
+        self._fade.valueChanged.connect(self._opacity.setOpacity)
+        self._fade.finished.connect(self._finish_fade)
+        self._recolor()
+        watch_appearance(self._recolor)
         super().hide()
 
+    def _icon_button(self, size, tip):
+        button = QToolButton(self)
+        button.setFixedSize(size, size)
+        button.setIconSize(QSize(size, size))
+        button.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        button.setToolTip(tip)
+        button.setAccessibleName(tip)
+        button.setStyleSheet("QToolButton { background: transparent; border: none; padding: 0; }"
+                             "QToolButton:pressed { background: palette(mid); border-radius: 6px; }")
+        return button
+
+    def _recolor(self):
+        palette = self.label.palette()
+        palette.setColor(QPalette.ColorRole.WindowText, Theme.ink(.95))
+        self.label.setPalette(palette)
+        self.cancel_button.setIcon(template_icon("xmark.circle.fill", self.cancel_button, tint=Theme.secondary_ink()))
+        self._update_copy_icon()
+        self.bar.update()
+        self.update()
+
+    def _update_copy_icon(self):
+        copied = self._copy_timer.isActive()
+        if copied or self._symbol is not None:
+            name = "doc.on.doc.fill" if copied else self._symbol
+            if copied:
+                tint = QColor("#30d158" if is_dark() else "#34c759")
+            else:
+                tint = self._tint() if callable(self._tint) else self._tint
+            self.icon.setIcon(template_icon(name, self.icon, tint=tint))
+        tip = "Copied" if copied else self._copy_tip
+        self.icon.setToolTip(tip)
+        self.icon.setAccessibleName(tip)
+
+    def fit(self, max_width, max_height):
+        """Size for the visible contents, without asking the stage layout for space."""
+        margins = self.layout().contentsMargins()
+        padding = margins.left() + margins.right()
+        buttons = [button for button in (self.icon, self.cancel_button) if not button.isHidden()]
+        inset = padding + sum(button.width() + self._row.spacing() for button in buttons)
+        metrics = self.label.fontMetrics()
+        measure = QFontMetricsF(self.label.font(), self.label)
+        natural = ceil(max(measure.horizontalAdvance(line) for line in self.label.text().split("\n")))
+        spinning = not self.bar.isHidden()
+        width = min(max_width, max(natural + inset, self.bar.minimumWidth() + padding if spinning else 0))
+        line = metrics.height()
+        label_height = min(line + 2 * metrics.lineSpacing(), self.label.heightForWidth(max(1, width - inset)))
+        extra = margins.top() + margins.bottom() + (self.layout().spacing() + self.bar.height() if spinning else 0)
+        label_height = max(0, min(max_height - extra, max(line, label_height)))
+        self.label.setFixedHeight(label_height)
+        row_height = max(label_height, *(button.height() for button in buttons), 0)
+        self.resize(width, min(max_height, row_height + extra))
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Unlike painting transparent corners, this also clips the input region.
+        self.setMask(_rounded_mask(QRectF(self.rect()), self._radius))
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        material = Theme.bar_background()
+        material.setAlphaF(.96)
+        painter.fillPath(_rounded_path(QRectF(self.rect()), self._radius), material)
+
     def enterEvent(self, event):
-        self.hovered = True
+        self.hovered = self._shown
         super().enterEvent(event)
 
     def leaveEvent(self, event):
@@ -203,55 +305,119 @@ class Pill(QFrame):
         super().leaveEvent(event)
 
     def copy_message(self):
-        QApplication.clipboard().setText(self.label.text())
-        self.icon.setText("✓")
-        self.icon.setToolTip("Copied")
-        self._copy_timer.start(1200)
+        text = self.label.text()
+        if text:
+            QApplication.clipboard().setText(text)
+            self._copy_timer.start(1200)
+            self._update_copy_icon()
 
-    def show(self, text=None, symbol="ⓘ", tint=None, spinning=False, progress=None, remaining=None, cancellable=True):
-        if text is None:
-            return super().show()
-        was_hidden = self.isHidden()
-        self.label.setText(str(text))
-        self._copy_timer.stop()
-        self._symbol = {"checkmark.circle.fill": "✓", "exclamationmark.triangle.fill": "⚠"}.get(symbol, "ⓘ")
-        self.icon.setText(self._symbol)
-        self.icon.setToolTip("Click to copy this message")
-        self.icon.setVisible(symbol is not None and not spinning)
-        if tint is not None:
-            self.icon.setStyleSheet(f"color: {QColor(tint).name()}")
-        self.cancel_button.setVisible(spinning and cancellable and self.on_cancel is not None)
-        self.cancel_button.setEnabled(True)
-        self.bar.setVisible(spinning)
-        if spinning:
-            if was_hidden:
-                self.bar.reset()
-            if progress is not None:
-                self.bar.set(progress)
-            elif remaining is not None:
-                self.bar.run(remaining)
-            elif not self.bar.running:
-                self.bar.run(self.default_estimate)
-        self._deadline = time.monotonic() + max(0., remaining) if spinning and remaining is not None else None
-        self.remaining_label.setVisible(self._deadline is not None)
-        self._remaining_timer.start() if self._deadline is not None else self._remaining_timer.stop()
-        self._update_remaining()
-        super().show()
-
-    def _update_remaining(self):
-        if self._deadline is not None:
-            seconds = math.ceil(max(0., self._deadline - time.monotonic()))
-            self.remaining_label.setText(f"{seconds}s remaining" if seconds else "Finishing…")
+    def show(self, text=None, symbol="checkmark.circle.fill", tint=None, spinning=False, progress=None, remaining=None, cancellable=True):
+        if text is not None:
+            self._cancelling = spinning and ((self._shown and self._cancelling) or text == "Cancelling…")
+            self.label.setText("Cancelling…" if self._cancelling else str(text))
+            self._symbol = None if spinning else symbol
+            self._tint = tint if callable(tint) else QColor(tint) if tint is not None else Theme.accent
+            self._copy_timer.stop()
+            self._update_copy_icon()
+            self.icon.setVisible(self._symbol is not None)
+            self.cancel_button.setVisible(spinning and cancellable and self.on_cancel is not None)
+            self.cancel_button.setEnabled(not self._cancelling)
+            self.bar.setVisible(spinning)
+            if spinning:
+                if not self._shown:
+                    self.bar.reset()
+                if progress is not None:
+                    self.bar.set(progress)
+                elif remaining is not None:
+                    self.bar.run(remaining)
+                elif not self.bar.running:
+                    self.bar.run(self.default_estimate)
+        if not self._shown:
+            self._shown = True
+            self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+            super().show()
+            self._animate_opacity(1., 180)
+        self.contents_changed.emit()
 
     def cancel_pressed(self):
+        if self._cancelling or self.on_cancel is None:
+            return
+        self._cancelling = True
         self.cancel_button.setEnabled(False)
-        if self.on_cancel:
-            self.on_cancel()
+        self.label.setText("Cancelling…")
+        self.contents_changed.emit()
+        self.on_cancel()
 
     def hide(self):
-        self._remaining_timer.stop()
-        self.bar.reset()
-        super().hide()
+        if self._shown:
+            self._shown = False
+            self.hovered = False
+            self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+            self._animate_opacity(0., 250)
+
+    def _animate_opacity(self, target, duration):
+        self._fade.stop()
+        self._fade.setStartValue(self._opacity.opacity())
+        self._fade.setEndValue(target)
+        self._fade.setDuration(duration)
+        self._fade.start()
+
+    def _finish_fade(self):
+        if not self._shown:
+            self._copy_timer.stop()
+            self.bar.reset()
+            super().hide()
+
+
+class _StageCard(QWidget):
+    def __init__(self, center_split, parent):
+        super().__init__(parent)
+        self._split = center_split
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(1, 1, 1, 1)
+        layout.addWidget(center_split)
+        watch_appearance(self.update)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # The splitter (including both panes and its divider) shares the card's clip.
+        self._split.setMask(_rounded_mask(QRectF(0, 0, self.width() - 2, self.height() - 2), 11))
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(QPen(Theme.ink(.22), 1))
+        painter.setBrush(Theme.canvas_bottom())
+        painter.drawRoundedRect(QRectF(self.rect()).adjusted(.5, .5, -.5, -.5), 11.5, 11.5)
+
+
+class StageHost(QWidget):
+    """Keep the editor stage and both independently raised overlays in one column."""
+    def __init__(self, center_split, busy_pill, toast_pill):
+        super().__init__()
+        self.setAutoFillBackground(True)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.addWidget(_StageCard(center_split, self))
+        self._busy, self._toast = busy_pill, toast_pill
+        for pill in (toast_pill, busy_pill):
+            pill.setParent(self)
+            pill.contents_changed.connect(self.place_pills)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.place_pills()
+
+    def place_pills(self):
+        width, height = self.width(), self.height()
+        if not self._toast.isHidden():
+            self._toast.fit(max(0, min(620, width - 20)), max(0, height - 100))
+            self._toast.move((width - self._toast.width()) // 2, height - self._toast.height() - 90)
+            self._toast.raise_()
+        if not self._busy.isHidden():
+            self._busy.fit(max(0, width - 34), max(0, height - 32))
+            self._busy.move(width - self._busy.width() - 24, 22)
+            self._busy.raise_()
 
 
 class _LineNumbers(QWidget):
@@ -262,14 +428,22 @@ class _LineNumbers(QWidget):
     def paintEvent(self, event):
         editor = self.editor
         painter = QPainter(self)
-        painter.fillRect(event.rect(), Theme.bar_background())
-        painter.setPen(Theme.ink(.45))
+        painter.fillRect(event.rect(), Theme.code_background())
+        painter.setFont(editor.font())
+        gap = editor.gutter_gap()
         block = editor.firstVisibleBlock()
         top = editor.blockBoundingGeometry(block).translated(editor.contentOffset()).top()
         while block.isValid() and top <= event.rect().bottom():
             height = editor.blockBoundingRect(block).height()
             if block.isVisible() and top + height >= event.rect().top():
-                painter.drawText(0, round(top), self.width() - 6, round(height), Qt.AlignmentFlag.AlignRight, str(block.blockNumber() + editor.start_line))
+                rect = QRectF(0, top, self.width(), height)
+                color = editor.line_backgrounds.get(block.blockNumber())
+                if color is not None:
+                    painter.fillRect(rect, color)
+                painter.setPen(editor.comment_ink)
+                painter.drawText(rect.adjusted(0, 0, -gap, 0),
+                                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter,
+                                 str(block.blockNumber() + editor.start_line))
             top += height
             block = block.next()
 
@@ -278,30 +452,71 @@ class SourceCodeView(QPlainTextEdit):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.on_focus = self.on_blur = self.on_change = None
-        self.start_line = 1
-        self.setFont(Theme.mono(12))
+        self.start_line = None
+        self.line_backgrounds = {}
+        self.comment_ink = Theme.ink(.5)
+        self.setFont(Theme.mono(11.5))
+        self.setFrameShape(QFrame.Shape.NoFrame)
         self.setLineWrapMode(QPlainTextEdit.LineWrapMode.NoWrap)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOn)
+        self.document().setDocumentMargin(6)
         self.gutter = _LineNumbers(self)
         self.blockCountChanged.connect(self._margin)
         self.updateRequest.connect(self._update_gutter)
         self.textChanged.connect(lambda: self.on_change() if self.on_change else None)
         self._margin()
 
-    @property
-    def string(self):
-        return self.toPlainText()
+    def set_numbering(self, start_line=None):
+        self.start_line = start_line
+        self._margin()
+        self.gutter.update()
 
-    @string.setter
-    def string(self, text):
-        self.setPlainText(text)
-        self.document().clearUndoRedoStacks()
+    def gutter_gap(self):
+        advance = QFontMetricsF(self.font()).horizontalAdvance("9")
+        return max(0, ceil(2 * advance - self.document().documentMargin()))
 
     def _margin(self):
-        width = 12 + self.fontMetrics().horizontalAdvance("9") * len(str(max(1, self.blockCount() + self.start_line - 1)))
-        self.setViewportMargins(width, 0, 0, 0)
-        self.gutter.setGeometry(0, 0, width, self.height())
+        numbered = self.start_line is not None
+        width = 0
+        if numbered:
+            digits = max(5, len(str(self.blockCount() + self.start_line - 1)))
+            advance = QFontMetricsF(self.font()).horizontalAdvance("9")
+            width = ceil(digits * advance + self.document().documentMargin()) + self.gutter_gap()
+        margins = self.viewportMargins()
+        if margins.left() != width:
+            self.setViewportMargins(width, 0, 0, 0)
+        viewport = self.viewport().geometry()
+        self.gutter.setGeometry(viewport.x() - width, viewport.y(), width, viewport.height())
+        self.gutter.setVisible(numbered)
+
+    def set_line_backgrounds(self, backgrounds):
+        self.line_backgrounds = backgrounds
+        highlights = []
+        for index, color in backgrounds.items():
+            extra = QTextEdit.ExtraSelection()
+            extra.cursor = QTextCursor(self.document().findBlockByNumber(index))
+            extra.format.setBackground(color)
+            extra.format.setProperty(QTextFormat.Property.FullWidthSelection, True)
+            highlights.append(extra)
+        self.setExtraSelections(highlights)
+        self.gutter.update()
+
+    def reveal_line(self, index):
+        block = self.firstVisibleBlock()
+        top = self.blockBoundingGeometry(block).translated(self.contentOffset()).top()
+        while block.isValid() and top < self.viewport().height():
+            height = self.blockBoundingRect(block).height()
+            if block.blockNumber() == index and top >= 0 and top + height <= self.viewport().height():
+                return
+            top += height
+            block = block.next()
+        # In a no-wrap QPlainTextEdit the vertical scroll unit is a block, not a pixel.
+        self.verticalScrollBar().setValue(index)
 
     def _update_gutter(self, rect, dy):
+        if self.start_line is None:
+            return
         if dy:
             self.gutter.scroll(0, dy)
         else:
@@ -321,17 +536,6 @@ class SourceCodeView(QPlainTextEdit):
         if self.on_blur:
             self.on_blur()
 
-    def keyPressEvent(self, event):
-        if event.key() == Qt.Key.Key_Tab and not event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            self.insertPlainText("    ")
-            return
-        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            cursor = self.textCursor()
-            before = cursor.block().text()[:cursor.positionInBlock()]
-            indentation = before[:len(before) - len(before.lstrip(" \t"))]
-            self.insertPlainText("\n" + indentation + ("    " if before.rstrip().endswith(":") else ""))
-            return
-        super().keyPressEvent(event)
 
 
 class MultilineTextBox(QTextEdit):
@@ -533,47 +737,54 @@ class MultilineTextBox(QTextEdit):
         self.fit()
 
 
-class FlatRowView(QWidget):
-    """A row intentionally has no system selection fill; thumbnails carry rings."""
+def _thumbnail_rect(rect, image):
+    scale = min(rect.width() / image.width(), rect.height() / image.height())
+    w, h = image.width() * scale, image.height() * scale
+    return QRectF(rect.center().x() - w / 2, rect.center().y() - h / 2, w, h)
+
+
+def _aspect_height(width):
+    return (width * 9 + 8) // 16
 
 
 class BuildPanel(QWidget):
-    def __init__(self, image=None, index=0, active=False, handler=None, parent=None):
+    _strip = False
+
+    def __init__(self, image, index, active, handler, parent=None):
         super().__init__(parent)
-        self.image = image if isinstance(image, QImage) else QImage(str(image)) if image else QImage()
-        self.index, self.active, self.handler = index, active, handler
+        self.image = image
+        self.number, self.active, self.handler = str(index + 1), active, handler
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.setToolTip(f"Build {index + 1}")
+        self.setAccessibleName(f"Build {self.number}")
+        if not self._strip:
+            self.setToolTip(self.accessibleName())
         self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.setMinimumSize(32, 18)
-        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-
-    def sizeHint(self):
-        return QSize(160, 90)
-
-    def resizeEvent(self, event):
-        super().resizeEvent(event)
-        height = round(self.width() * 9 / 16)
-        if self.height() != height:
-            self.setFixedHeight(height)
+        watch_appearance(self.update)
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), Qt.GlobalColor.black)
+        painter.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
+        rect = QRectF(self.rect())
+        radius = 6 if self._strip else 5
+        clip = _rounded_path(rect, radius)
+        painter.setClipPath(clip)
+        if not self._strip:
+            painter.fillPath(clip, Qt.GlobalColor.black)
         if not self.image.isNull():
-            target = self.image.size().scaled(self.size(), Qt.AspectRatioMode.KeepAspectRatio)
-            rect = QRectF((self.width()-target.width())/2, (self.height()-target.height())/2, target.width(), target.height())
-            painter.setOpacity(1. if self.active else .72)
-            painter.drawImage(rect, self.image)
+            painter.setOpacity(1. if self.active else .78 if self._strip else .72)
+            painter.drawImage(rect if self._strip else _thumbnail_rect(rect, self.image), self.image)
             painter.setOpacity(1.)
-        painter.setPen(QPen(Theme.accent if self.active else Theme.ink(.22), 2 if self.active else 1))
-        painter.setBrush(Qt.BrushStyle.NoBrush)
-        painter.drawRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), 5, 5)
-        painter.fillRect(4, 3, 18, 14, QColor(0, 0, 0, 160))
+        border = Theme.accent if self.active else Theme.ink(.14 if self._strip else .35)
+        width = 2 if self.active else 1
+        painter.setPen(QPen(border, width))
+        inset = width / 2
+        painter.drawRoundedRect(rect.adjusted(inset, inset, -inset, -inset), radius - inset, radius - inset)
+
+        badge = QRectF(4, 3, 14, 13 if self._strip else 12)
+        painter.fillPath(_rounded_path(badge, 4 if self._strip else 3), QColor.fromRgbF(0, 0, 0, .55))
         painter.setPen(Qt.GlobalColor.white)
-        painter.setFont(Theme.font(9))
-        painter.drawText(4, 3, 18, 14, Qt.AlignmentFlag.AlignCenter, str(self.index + 1))
+        painter.setFont(Theme.font(10 if self._strip else 9, QFont.Weight.Bold))
+        painter.drawText(badge, Qt.AlignmentFlag.AlignCenter, self.number)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self.handler:
@@ -584,6 +795,8 @@ class BuildPanel(QWidget):
 
 
 class StepButton(BuildPanel):
+    _strip = True
+
     def __init__(self, path, index=0, active=False, handler=None, parent=None):
         super().__init__(_mapped_image(path), index, active, handler, parent)
         self.setFixedSize(80, 45)
@@ -596,105 +809,140 @@ def _mapped_image(path):
     return DarkMode.image(path=str(path)) or QImage()
 
 
-class SlideCell(FlatRowView):
+class SlideCell(QWidget):
     thumb_inset, build_indent, build_spacing, base_height = 42, 16, 6, 108
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.on_build = None
         self.on_click = None
-        self.num = QLabel(self)
-        self.num.setFont(Theme.font(11))
-        self.thumb = QLabel(self)
-        self.name = QLabel(self)
-        self.name.setFont(Theme.font(10))
-        self.badge = QLabel(self)
-        self.badge.setFont(Theme.font(10))
+        self._number_font = Theme.font(11, QFont.Weight.Medium)
+        self._caption_font = Theme.font(10)
+        self._badge_font = Theme.font(10, QFont.Weight.Medium)
+        self._number = self._caption = self._badge = ""
         self._image = QImage()
-        self._active = False
-        self._hidden = False
+        self._active = self._hidden = False
         self._panels = []
-        self._unused = False
-        self._status = "pending"
-        self._name = ""
+        watch_appearance(self.update)
 
     @staticmethod
-    def row_height(column_width, builds=0):
-        thumb_w = max(40, column_width - SlideCell.thumb_inset)
-        thumb_h = round(thumb_w * 9 / 16)
+    def _caption_height():
+        return max(13, QFontMetrics(Theme.font(10, QFont.Weight.Medium)).height())
+
+    @classmethod
+    def row_height(cls, column_width, builds=0):
+        width = max(40, column_width - cls.thumb_inset)
+        caption_bottom = 6 + _aspect_height(width) + 4 + cls._caption_height()
         if builds <= 0:
-            return max(108, 6 + thumb_h + 4 + 13 + 2)
-        top = max(108, 6 + thumb_h + 4 + 13 + 6)
-        return top + builds * (round(max(32, thumb_w - 16) * 9 / 16) + 6) + 2
+            return max(cls.base_height, caption_bottom + 2)
+        top = max(cls.base_height, caption_bottom + cls.build_spacing)
+        return top + builds * (_aspect_height(max(32, width - cls.build_indent)) + cls.build_spacing) + 2
 
     def configure(self, number, name, image=None, status="pending", stops=0, active=False, unused=False, hidden=False, expanded=None):
-        self._name, self._hidden, self._unused, self._status = name, hidden, unused, status
+        self._caption = f"{name} — error" if status == "error" else name
+        self._hidden = hidden
         self._image = image if isinstance(image, QImage) else QImage()
-        self.num.setText("–" if unused else str(number))
-        font = self.num.font()
-        font.setStrikeOut(hidden and not unused)
-        self.num.setFont(font)
-        self.name.setToolTip(name)
+        if hidden and self._image.hasAlphaChannel():
+            black = QImage(self._image.size(), QImage.Format.Format_RGB32)
+            black.fill(Qt.GlobalColor.black)
+            with QPainter(black) as painter:
+                painter.drawImage(0, 0, self._image)
+            self._image = black
+        self._number = "–" if unused else str(number)
+        self._number_font.setStrikeOut(hidden and not unused)
         chevron = "" if expanded is None else " ▾" if expanded else " ▸"
-        self.badge.setText("unused" if unused else "hidden" if hidden else f"{stops} builds{chevron}" if stops > 1 else "…" if self._image.isNull() and status != "error" else "")
+        if unused:
+            self._badge = "unused"
+        elif hidden:
+            self._badge = "hidden"
+        elif stops > 1:
+            self._badge = f"{stops} builds{chevron}"
+        else:
+            self._badge = "…" if self._image.isNull() and status != "error" else ""
+        self.setAccessibleName(" ".join(filter(None, (self._number, self._caption, self._badge))))
         self.set_active(active)
         self.set_builds([], -1)
-        self._layout()
 
     def set_active(self, active):
         self._active = active
-        self.num.setStyleSheet(f"color: {(Theme.accent if active else Theme.ink(.45)).name()}")
-        self.name.setStyleSheet(f"color: {(QColor('#E54141') if self._status == 'error' else Theme.ink(.95 if active else .65)).name()}")
         self.update()
 
     def set_builds(self, images, active=-1):
         for panel in self._panels:
+            panel.hide()
             panel.deleteLater()
         self._panels = []
         for i, image in enumerate(images):
             panel = BuildPanel(image, i, i == active, lambda index=i: self.on_build(index) if self.on_build else None, self)
             panel.show()
             self._panels.append(panel)
-        self._layout()
+        self._layout_builds()
 
-    def _layout(self):
-        width = max(40, self.width() - self.thumb_inset)
-        height = round(width * 9 / 16)
-        self.num.setGeometry(2, 8, 20, 18)
-        self.thumb.setGeometry(30, 6, width, height)
-        badge_w = self.badge.sizeHint().width()
-        self.badge.setGeometry(30 + width - badge_w, 10 + height, badge_w, 15)
-        name_width = max(0, width - badge_w - 4)
-        text = self._name + (" — error" if self._status == "error" else "")
-        self.name.setText(self.name.fontMetrics().elidedText(text, Qt.TextElideMode.ElideRight, name_width))
-        self.name.setGeometry(32, 10 + height, name_width, 15)
-        y = max(108, 6 + height + 4 + 13 + 6)
-        build_width = max(32, width - self.build_indent)
+    def _layout_builds(self):
+        thumb_width = max(40, self.width() - self.thumb_inset)
+        build_width = max(32, thumb_width - self.build_indent)
+        height = _aspect_height(build_width)
+        top = max(self.base_height, 6 + _aspect_height(thumb_width) + 4 + self._caption_height() + self.build_spacing)
         for panel in self._panels:
-            h = round(build_width * 9 / 16)
-            panel.setGeometry(46, y, build_width, h)
-            y += h + self.build_spacing
-        self.update()
+            panel.setGeometry(30 + self.build_indent, top, build_width, height)
+            top += height + self.build_spacing
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        self._layout()
+        self._layout_builds()
 
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        rect = QRectF(self.thumb.geometry())
-        painter.fillRect(rect, Qt.GlobalColor.black)
-        if not self._image.isNull():
-            painter.setOpacity(.4 if self._hidden else 1.)
-            size = self._image.size().scaled(rect.size().toSize(), Qt.AspectRatioMode.KeepAspectRatio)
-            target = QRectF(rect.center().x()-size.width()/2, rect.center().y()-size.height()/2, size.width(), size.height())
-            painter.drawImage(target, self._image)
-            painter.setOpacity(1.)
+        painter.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
+        width = max(40, self.width() - self.thumb_inset)
+        rect = QRectF(30, 6, width, _aspect_height(width))
+        clip = _rounded_path(rect, 5)
         if self._active:
+            ring = rect.adjusted(-2, -2, 2, 2)
+            shadow = ring.translated(0, 1.5)
+            for spread, alpha in ((4, .02), (3, .03), (2, .05), (1, .08), (0, .13)):
+                path = _rounded_path(shadow.adjusted(-spread, -spread, spread, spread), 7 + spread)
+                painter.fillPath(path.subtracted(clip), QColor.fromRgbF(0, 0, 0, alpha))
             painter.setPen(QPen(Theme.accent, 2.5))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            painter.drawRoundedRect(rect.adjusted(-2, -2, 2, 2), 7, 7)
+            painter.drawRoundedRect(ring, 7, 7)
+        if self._image.isNull():
+            painter.setOpacity(.4 if self._hidden else 1.)
+            painter.fillPath(clip, Qt.GlobalColor.black)
+            painter.setOpacity(1.)
+        else:
+            art = _thumbnail_rect(rect, self._image)
+            painter.save()
+            painter.setOpacity(.4 if self._hidden else 1.)
+            matte = clip
+            if self._hidden:
+                # The matte and opaque image are one layer, not two applications of .4 opacity.
+                cutout = QPainterPath()
+                cutout.addRect(art)
+                matte = clip.subtracted(cutout)
+            painter.fillPath(matte, Qt.GlobalColor.black)
+            painter.setClipPath(clip)
+            painter.drawImage(art, self._image)
+            painter.restore()
+
+        painter.setPen(Theme.accent if self._active else Theme.tertiary_ink())
+        painter.setFont(self._number_font)
+        align_right = Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
+        painter.drawText(QRectF(2, 8, 20, QFontMetrics(self._number_font).height()), align_right, self._number)
+
+        caption_y = rect.bottom() + 4
+        caption_h = self._caption_height()
+        badge_w = QFontMetrics(self._badge_font).horizontalAdvance(self._badge)
+        badge_x = rect.right() - 2 - badge_w
+        painter.setFont(self._badge_font)
+        painter.setPen(Theme.tertiary_ink())
+        painter.drawText(QRectF(badge_x, caption_y, badge_w, caption_h), align_right, self._badge)
+
+        name_width = max(0, int(badge_x - 4 - 32))
+        name = QFontMetrics(self._caption_font).elidedText(self._caption, Qt.TextElideMode.ElideRight, name_width)
+        painter.setFont(self._caption_font)
+        painter.setPen(Theme.ink(.95) if self._active else Theme.secondary_ink())
+        painter.drawText(QRectF(32, caption_y, name_width, caption_h),
+                         Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, name)
 
     def mousePressEvent(self, event):
         if event.button() == Qt.MouseButton.LeftButton and self.on_click:
@@ -721,12 +969,14 @@ class SlideTable(QListWidget):
         self._press_position = None
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.setItemDelegate(_FlatRowDelegate(self))
+        self.setSpacing(0)
         self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
         self.setDefaultDropAction(Qt.DropAction.MoveAction)
         self.setDropIndicatorShown(True)
-        self.setStyleSheet(f"QListWidget {{ background: {Theme.sidebar_background().name()}; border: none; }} QListWidget::item:selected {{ background: transparent; }}")
+        self.setStyleSheet("QListWidget { background: transparent; border: none; outline: none; }"
+                           "QListWidget::item:selected { background: transparent; }")
 
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) and self.currentRow() >= 0:
@@ -789,13 +1039,17 @@ class SlideTable(QListWidget):
 
 
 class _HairlineHandle(QSplitterHandle):
+    def __init__(self, orientation, parent):
+        super().__init__(orientation, parent)
+        watch_appearance(self.update)
+
     def paintEvent(self, event):
         painter = QPainter(self)
-        painter.setPen(Theme.ink(.16))
         if self.orientation() == Qt.Orientation.Horizontal:
-            painter.drawLine(self.width()//2, 0, self.width()//2, self.height())
+            line = QRectF(self.width() // 2, 0, 1, self.height())
         else:
-            painter.drawLine(0, self.height()//2, self.width(), self.height()//2)
+            line = QRectF(0, self.height() // 2, self.width(), 1)
+        painter.fillRect(line, Theme.separator())
 
 
 class GrabSplitView(QSplitter):
@@ -842,7 +1096,22 @@ class GrabSplitView(QSplitter):
             self._restored = True
             sizes = prefs.get_json(self.settings_key, [])
             if isinstance(sizes, list) and len(sizes) == self.count() and all(isinstance(s, int) and s >= 0 for s in sizes) and sum(sizes):
+                if self._collapses_edge_panes and self.orientation() == Qt.Orientation.Horizontal and len(sizes) == 3:
+                    sizes = self._fit_saved_widths(sizes)
                 self.setSizes(sizes)
+
+    def _fit_saved_widths(self, widths):
+        span = self.contentsRect().width() - (self.count() - 1) * self.handleWidth()
+        widths = [max(w, self.widget(i).minimumWidth()) if w or i == 1 else 0 for i, w in enumerate(widths)]
+        excess = sum(widths) - span
+        if excess < 0:
+            widths[1] -= excess
+        else:
+            for i in (1, 2, 0):
+                reduction = min(excess, max(0, widths[i] - self.widget(i).minimumWidth()))
+                widths[i] -= reduction
+                excess -= reduction
+        return widths
 
     def _resized(self, *_):
         if self.settings_key:

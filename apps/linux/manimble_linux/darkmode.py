@@ -91,6 +91,7 @@ class DarkModeMixin:
         DarkMode.mode = ColorView(m)
         prefs.set("colorView", DarkMode.mode.value)
         self.canvas.color_view = DarkMode.mode
+        self.update_dark_mode_item()
         # Navigator thumbnails use the same mapper, so invalidate their paint cache too.
         self.table.viewport().update()
         self.rebuild_steps()

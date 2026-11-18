@@ -39,6 +39,10 @@ The buttons in the drawer's header act on the active terminal:
 When you choose an agent that isn't installed, Manimble shows how to install it and offers to type the install
 command into the terminal.
 
+On Linux, choosing an agent just selects it. If you click **Run** for a missing agent, Manimble asks before putting
+the install command into the shell and leaves it at the prompt for you to review. **Terminal Options** holds
+**Find…** and **Font and Size…**.
+
 ## Edit commands in the terminal
 
 While you're typing in the terminal, the Edit menu acts on the terminal, never on the slide:
@@ -62,6 +66,9 @@ To start terminals in the original deck's project repository instead (its git ro
 deck), turn off **View ▸ Terminal Starts in Working Copy**. Running terminals restart in the new folder. Edits made
 there change your original files directly and don't show on the open deck. See
 [Working with git](agents.md#working-with-git).
+
+On Linux, the header shows **Working copy** or **Original folder**. Choosing the original folder warns you before
+restarting shells. Cancel leaves the folder and current shells unchanged.
 
 ## Environment
 

@@ -101,6 +101,9 @@ The app and its private Python environment are copied into `$XDG_DATA_HOME/manim
 Preferences, caches and working copies use the XDG config, cache and state directories. Rerun the installer after
 pulling updates. Desktop registration does not change the default handler for `.manimble` files.
 
+The Linux bundle includes Comic Neue and Nunito Sans. When a Mac theme font is missing, the editor and renderer
+resolve the same local substitute. Opening a deck does not rewrite its font names.
+
 Ubuntu may need an AppArmor user namespace exception for the installed `QtWebEngineProcess`. The installer asks
 for separate permission and scopes the profile to that exact executable. `--install-webengine-profile` explicitly
 approves the exception, while `--yes` alone does not. Without the required permission, the terminal remains

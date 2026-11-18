@@ -50,7 +50,8 @@ UBUNTU=(
     libcairo2-dev libpango1.0-dev ffmpeg poppler-utils ghostscript espeak-ng
     texlive-latex-extra texlive-fonts-recommended texlive-fonts-extra
     texlive-science texlive-lang-english texlive-xetex dvisvgm
-    fontconfig fonts-dejavu-core libegl1 libgl1 libopengl0 libgl1-mesa-dri libgbm1
+    fontconfig fonts-dejavu-core fonts-inter fonts-urw-base35
+    libegl1 libgl1 libopengl0 libgl1-mesa-dri libgbm1
     libdbus-1-3 libnss3 libnspr4 libasound2t64 libpulse0 libx11-xcb1
     libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-render-util0
     libxcb-xinerama0 libxcb-xkb1 libxkbcommon-x11-0 libxcomposite1 libxdamage1
@@ -60,7 +61,8 @@ UBUNTU=(
 ARCH=(
     base-devel pkgconf python python-pip cairo pango ffmpeg poppler ghostscript espeak-ng
     texlive-latexextra texlive-fontsrecommended texlive-fontsextra texlive-mathscience
-    texlive-langenglish texlive-xetex dvisvgm fontconfig ttf-dejavu mesa libglvnd
+    texlive-langenglish texlive-xetex dvisvgm fontconfig ttf-dejavu adwaita-fonts gsfonts
+    mesa libglvnd
     libpulse alsa-lib dbus nss nspr libx11 libxcb libxrender libxext libsm libice
     libxkbcommon-x11 libxcomposite libxdamage libxrandr libxtst libxkbfile
     xcb-util xcb-util-cursor xcb-util-image xcb-util-keysyms xcb-util-renderutil xcb-util-wm
@@ -157,6 +159,11 @@ try:
     for name in ('engine', 'apps/linux'):
         shutil.copytree(root / name, stage / name,
                         ignore=shutil.ignore_patterns('__pycache__', '*.pyc', '.venv', '.pytest_cache'))
+    assets = Path('apps/macos/assets')
+    (stage / assets).mkdir(parents=True)
+    for name in ('Manimble.icns', 'ManimbleDocument.icns', 'biocartoon.png',
+                 'biocartoon-mono.png', 'biocartoon-mono.svg'):
+        shutil.copy2(root / assets / name, stage / assets / name)
     if app.exists():
         backup = Path(tempfile.mkdtemp(prefix='.app-old-', dir=app.parent)) / 'app'
         os.replace(app, backup)
@@ -189,7 +196,7 @@ import shlex
 import sys
 from PIL import Image
 
-app, venv, bin_dir, data, home, root = map(Path, sys.argv[1:])
+app, venv, bin_dir, data, home, _root = map(Path, sys.argv[1:])
 
 def atomic(path, text, mode=0o644):
     temporary = path.with_name(path.name + '.tmp')
@@ -222,13 +229,29 @@ atomic(applications / 'manimble.desktop', template.replace('@MANIMBLE_EXEC@', ex
 mime = data / 'mime/packages'
 mime.mkdir(parents=True, exist_ok=True)
 atomic(mime / 'manimble-mime.xml', (app / 'apps/linux/resources/manimble-mime.xml').read_text(encoding='utf-8'))
-icon = data / 'icons/hicolor/256x256/apps/manimble.png'
-icon.parent.mkdir(parents=True, exist_ok=True)
-with Image.open(root / 'apps/macos/assets/Manimble.icns') as source:
-    image = source.convert('RGBA').resize((256, 256), Image.Resampling.LANCZOS)
-    temporary = icon.with_suffix('.tmp')
-    image.save(temporary, format='PNG')
-    os.replace(temporary, icon)
+assets = app / 'apps/macos/assets'
+for filename, destination in (
+    ('Manimble.icns', 'apps/manimble.png'),
+    ('ManimbleDocument.icns', 'mimetypes/application-x-manimble-project.png'),
+):
+    with Image.open(assets / filename) as source:
+        # ICNS lists logical dimensions and scale separately; hicolor uses physical pixels.
+        for target in (16, 32, 48, 64, 128, 256, 512):
+            def rank(size):
+                width = size[0] * size[2]
+                return width < target, abs(width - target), size[2]
+
+            size = min(source.info['sizes'], key=rank)
+            image = source.icns.getimage(size)
+            if image.mode != 'RGBA':
+                image = image.convert('RGBA')
+            if image.size != (target, target):
+                image = image.resize((target, target), Image.Resampling.LANCZOS)
+            icon = data / f'icons/hicolor/{target}x{target}' / destination
+            icon.parent.mkdir(parents=True, exist_ok=True)
+            temporary = icon.with_suffix('.tmp')
+            image.save(temporary, format='PNG')
+            os.replace(temporary, icon)
 PY
 
 # Ubuntu may forbid Chromium's user namespace sandbox. The exception is separate

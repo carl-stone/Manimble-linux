@@ -3,9 +3,11 @@
 window.addEventListener("DOMContentLoaded", () => {
   new QWebChannel(qt.webChannelTransport, channel => {
     const bridge = channel.objects.bridge;
-    const term = new Terminal({fontFamily: "monospace", fontSize: 13, scrollback: 10000,
-      cursorBlink: true, allowProposedApi: false,
-      theme: {background: "#17191e", foreground: "#e5e7eb", selectionBackground: "#405b85"}});
+    const root = document.documentElement;
+    const pagePalette = getComputedStyle(root);
+    const term = new Terminal({fontFamily: "monospace", fontSize: 12, scrollback: 10000,
+      cursorBlink: true, allowProposedApi: false, minimumContrastRatio: 4.5,
+      theme: {background: pagePalette.backgroundColor, foreground: pagePalette.color}});
     const fit = new FitAddon.FitAddon();
     const search = new SearchAddon.SearchAddon();
     term.loadAddon(fit);
@@ -66,7 +68,19 @@ window.addEventListener("DOMContentLoaded", () => {
         case "select_all": term.selectAll(); break;
         case "copy": bridge.copy_selection(term.getSelection()); break;
         case "scroll": term.scrollLines(msg.lines); break;
-        case "font": term.options.fontFamily = msg.family; term.options.fontSize = msg.size; fit.fit(); break;
+        case "settings":
+          if (msg.theme) {
+            root.style.colorScheme = msg.scheme;
+            root.style.setProperty("--terminal-background", msg.theme.background);
+            root.style.setProperty("--terminal-foreground", msg.theme.foreground);
+            term.options.theme = msg.theme;
+          }
+          if (msg.family !== undefined &&
+              (term.options.fontFamily !== msg.family || term.options.fontSize !== msg.size)) {
+            term.options = {fontFamily: msg.family, fontSize: msg.size};
+            fit.fit();
+          }
+          break;
         case "search":
           if (!msg.text) search.clearDecorations();
           else if (msg.previous) search.findPrevious(msg.text, {caseSensitive: msg.caseSensitive});

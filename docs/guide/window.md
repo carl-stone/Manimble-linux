@@ -38,7 +38,7 @@ From left to right:
 | **Zoom** | Zooms the canvas. |
 | **Dark Mode** | Shows the slides with whites and blacks swapped, without changing the deck. |
 | **Terminal** | Shows or hides the terminal. See [The terminal](../ai/terminal.md). |
-| **Share** | Exports the deck as PDF, PowerPoint, Keynote, Beamer or a movie. See [Exporting](../sharing/export.md). |
+| **Share** | Exports a PDF, PowerPoint deck, Beamer deck or movie. Keynote export is macOS-only. See [Exporting](../sharing/export.md). |
 
 ## Home bar
 
@@ -49,6 +49,9 @@ guide controls, the **Script** and **View Feedback** buttons, and, at the right 
 
 Every control on the Home bar is also in the **Format**, **View** or **Insert** menu, usually with a keyboard
 shortcut.
+
+On Linux, less-used controls move into the Home bar's overflow at narrow widths. The replace row opens over the
+canvas rather than resizing it.
 
 ## Navigator
 
@@ -79,12 +82,15 @@ Zoom with **View ▸ Zoom In** (<kbd>⌘</kbd><kbd>=</kbd>), **View ▸ Zoom Out
 The inspector shows the properties of the selected object: its kind, the line of code that made it, its text or
 formula, its appearance, and its position and size. With nothing selected it shows the slide's name and a few tips.
 Some panels open in the inspector's place: the Script panel, the feedback list and the BioCartoon icon search.
+**Done** returns to the inspector without changing which drawer tab is open.
 
 ## Source pane
 
 The source pane shows the Python code of the current slide, with the lines of the selected object highlighted. Lines
 changed by your last edit are highlighted too. Click into the code to edit it; see
 [Editing the Python source](source.md).
+
+On Linux, use the Python card's error button to read or copy the full diagnostic without discarding your draft.
 
 ## Drawer
 
@@ -98,6 +104,8 @@ The drawer under the canvas holds tabs:
 **View ▸ Speaker Notes** (<kbd>⌥</kbd><kbd>⌘</kbd><kbd>K</kbd>) and **View ▸ Show Terminal**
 (<kbd>⌥</kbd><kbd>⌘</kbd><kbd>T</kbd>) open the drawer on those tabs. See [Notes and alt text](notes.md) and
 [The terminal](../ai/terminal.md).
+
+On Linux, **View ▸ Engine Log** opens the engine output in the same drawer.
 
 ## Tips and messages
 

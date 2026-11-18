@@ -6,11 +6,11 @@ import random
 from dataclasses import dataclass, replace
 
 from PySide6.QtCore import QEvent, QPointF, QRectF, Qt, QTimer
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtGui import QColor, QFont, QFontMetricsF, QPainter, QPen
 from PySide6.QtWidgets import QApplication, QWidget
 
 from . import prefs
-from .tasks import spawn
+from .style import Theme
 
 
 @dataclass
@@ -24,13 +24,13 @@ class Piece:
 class AuxPaneView(QWidget):
     cols, rows = 10, 20
     kinds = [
-        ([(0, 1), (1, 1), (2, 1), (3, 1)], 4, "#4dd1f2"),
-        ([(0, 0), (1, 0), (0, 1), (1, 1)], 2, "#ffcc40"),
-        ([(1, 0), (0, 1), (1, 1), (2, 1)], 3, "#9e66ff"),
-        ([(1, 0), (2, 0), (0, 1), (1, 1)], 3, "#66d97a"),
-        ([(0, 0), (1, 0), (1, 1), (2, 1)], 3, "#ff6173"),
-        ([(0, 0), (0, 1), (1, 1), (2, 1)], 3, "#598cff"),
-        ([(2, 0), (0, 1), (1, 1), (2, 1)], 3, "#ff9f43"),
+        ([(0, 1), (1, 1), (2, 1), (3, 1)], 4, QColor.fromRgbF(.30, .82, .95)),
+        ([(0, 0), (1, 0), (0, 1), (1, 1)], 2, QColor.fromRgbF(1, .80, .25)),
+        ([(1, 0), (0, 1), (1, 1), (2, 1)], 3, QColor.fromRgbF(.62, .40, 1)),
+        ([(1, 0), (2, 0), (0, 1), (1, 1)], 3, QColor.fromRgbF(.40, .85, .48)),
+        ([(0, 0), (1, 0), (1, 1), (2, 1)], 3, QColor.fromRgbF(1, .38, .45)),
+        ([(0, 0), (0, 1), (1, 1), (2, 1)], 3, QColor.fromRgbF(.35, .55, 1)),
+        ([(2, 0), (0, 1), (1, 1), (2, 1)], 3, Theme.accent),
     ]
 
     def __init__(self, parent=None):
@@ -227,7 +227,7 @@ class AuxPaneView(QWidget):
     def paintEvent(self, event):
         painter = QPainter(self)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QColor("#1b1b1b"))
+        painter.fillRect(self.rect(), QColor.fromRgbF(.105, .105, .105))
         cell = math.floor(min((self.width()-42)/16, (self.height()-28)/20))
         if cell < 4:
             return
@@ -235,17 +235,18 @@ class AuxPaneView(QWidget):
         ox, oy = math.floor((self.width()-bw-14-panel)/2), math.floor((self.height()-bh)/2)
         well = QRectF(ox, oy, bw, bh)
         painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#131313"))
+        painter.setBrush(QColor.fromRgbF(.075, .075, .075))
         painter.drawRoundedRect(well.adjusted(-3, -3, 3, 3), 6, 6)
-        painter.setPen(QColor(255, 255, 255, 10))
+        grid = QColor.fromRgbF(1, 1, 1, .04)
         for x in range(1, self.cols):
-            painter.drawLine(QPointF(ox+x*cell, oy), QPointF(ox+x*cell, oy+bh))
+            painter.fillRect(QRectF(ox+x*cell, oy, 1, bh), grid)
         for y in range(1, self.rows):
-            painter.drawLine(QPointF(ox, oy+y*cell), QPointF(ox+bw, oy+y*cell))
+            painter.fillRect(QRectF(ox, oy+y*cell, bw, 1), grid)
         def block(x, y, kind, origin=(ox, oy), size=cell, ghost=False):
             rect = QRectF(origin[0]+x*size+1, origin[1]+y*size+1, size-2, size-2)
-            color = QColor(self.kinds[kind][2])
+            color = self.kinds[kind][2]
             if ghost:
+                color = QColor(color)
                 color.setAlphaF(.35)
                 painter.setBrush(Qt.BrushStyle.NoBrush)
                 painter.setPen(QPen(color, 1.5))
@@ -268,15 +269,20 @@ class AuxPaneView(QWidget):
                     block(x, y, self.piece.kind)
         px, y = ox+bw+14, oy
         small, big = max(9, cell*.42), max(11, cell*.7)
-        def text(value, size=small, alpha=.85):
+        label_font = Theme.font(small, QFont.Weight.DemiBold)
+        value_font = Theme.tabular(big, QFont.Weight.DemiBold)
+        hint_font = Theme.font(small)
+
+        def text(value, font, alpha):
             nonlocal y
-            font = QFont()
-            font.setPixelSize(round(size))
+            metrics = QFontMetricsF(font, self)
             painter.setFont(font)
-            painter.setPen(QColor(255, 255, 255, round(255*alpha)))
-            painter.drawText(QPointF(px, y+size), value)
-            y += size*1.4
-        text("NEXT", alpha=.5)
+            painter.setPen(QColor.fromRgbF(1, 1, 1, alpha))
+            painter.drawText(QPointF(px, y+metrics.ascent()), value)
+            y += metrics.height()
+
+        text("NEXT", label_font, .5)
+        y += cell*.3
         cells = self.kinds[self.next][0]
         size = cell*.8
         nx, ny = min(x for x, _ in cells), min(y for _, y in cells)
@@ -285,49 +291,49 @@ class AuxPaneView(QWidget):
             block(x, yy, self.next, (px+(panel-nw)/2-nx*size, y-ny*size), size)
         y += size*2+cell
         for label, value in [("SCORE", self.score), ("LINES", self.lines), ("LEVEL", self.level), ("BEST", max(self.best, self.score))]:
-            text(label, alpha=.5)
-            text(str(value), big)
+            text(label, label_font, .5)
+            text(str(value), value_font, .85)
             y += cell*.4
-        y = max(y, oy+bh-small*1.4*7)
-        for line in ["← → move", "↑ X rotate", "Z rotate back", "↓ drop", "space slam", "P pause", "esc back to code"]:
-            text(line, alpha=.4)
+        y = max(y, oy+bh-Theme.logical_size(small)*1.35*7)
+        for line in ["← →  move", "↑ X  rotate", "Z  rotate back", "↓  drop", "space  slam",
+                     "P  pause", "esc  back to code"]:
+            text(line, hint_font, .4)
         if self.over or self.paused:
-            painter.fillRect(well, QColor(0, 0, 0, 140))
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(QColor.fromRgbF(0, 0, 0, .55))
+            painter.drawRoundedRect(well, 4, 4)
+            title = "GAME OVER" if self.over else "PAUSED"
+            hint = "return to play again" if self.over else "P or click to resume"
+            center = well.center()
+            title_font = Theme.font(big*1.3, QFont.Weight.Bold)
+            title_metrics = QFontMetricsF(title_font, self)
+            painter.setFont(title_font)
             painter.setPen(QColor("white"))
-            painter.drawText(well.adjusted(0, -20, 0, -20), Qt.AlignmentFlag.AlignCenter, "GAME OVER" if self.over else "PAUSED")
-            painter.drawText(well.adjusted(0, 20, 0, 20), Qt.AlignmentFlag.AlignCenter, "Return to play again" if self.over else "P or click to resume")
+            painter.drawText(QPointF(center.x()-title_metrics.horizontalAdvance(title)/2,
+                                     center.y()-title_metrics.descent()), title)
+            hint_metrics = QFontMetricsF(hint_font, self)
+            painter.setFont(hint_font)
+            painter.setPen(QColor.fromRgbF(1, 1, 1, .7))
+            painter.drawText(QPointF(center.x()-hint_metrics.horizontalAdvance(hint)/2,
+                                     center.y()+4+hint_metrics.ascent()), hint)
 
 
 class PaneOverlayMixin:
     def toggle_pane_overlay(self, *_):
         current = getattr(self, "pane_overlay", None)
-        source = self.source_box
+        card = self.source_card
+        # Move focus before swapping pages so the ordinary source blur queues the draft once.
+        self.canvas.setFocus()
         if current:
             current.stop()
-            current.hide()
+            card.setCurrentWidget(self.source_box)
+            card.removeWidget(current)
             current.deleteLater()
             self.pane_overlay = None
-            source.show()
-            self.canvas.setFocus()
             return
-        def open_game():
-            yield from self.finish_edits()
-            if getattr(self, "pane_overlay", None):
-                return
-            card = source
-            game = AuxPaneView(card)
-            self.pane_overlay = game
-            game.on_exit = self.toggle_pane_overlay
-            # Match the source's actual layout rectangle, including later splitter resizes.
-            game.setGeometry(card.rect())
-            class ResizeFollower(QWidget):
-                def eventFilter(follower, watched, event):
-                    if event.type() == QEvent.Type.Resize:
-                        game.setGeometry(card.rect())
-                    return False
-            game._resize_follower = ResizeFollower(game)
-            card.installEventFilter(game._resize_follower)
-            game.show()
-            game.raise_()
-            game.setFocus()
-        return spawn(open_game()).future
+        game = AuxPaneView(card)
+        game.on_exit = self.toggle_pane_overlay
+        self.pane_overlay = game
+        card.addWidget(game)
+        card.setCurrentWidget(game)
+        game.setFocus()

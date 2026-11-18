@@ -8,12 +8,12 @@ from __future__ import annotations
 import inspect
 from pathlib import Path
 
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QApplication, QLineEdit, QPlainTextEdit, QTextEdit, QMessageBox
+from PySide6.QtCore import QFileInfo, QSize
+from PySide6.QtWidgets import QApplication, QFileIconProvider, QLineEdit, QPlainTextEdit, QTextEdit, QMessageBox
 
 from . import prefs
 from .actions import ActionRegistry
+from .icon_art import LAYOUT_ICON_SIZE, THEME_SWATCH_SIZE, layout_icon, set_menu_icon_size
 from .paths import version
 from .tasks import spawn
 
@@ -37,15 +37,27 @@ TEXT_ACTIONS = {"cut": "cut", "copy": "copy", "paste": "paste", "select_all": "s
                 "undo": "undo", "redo": "redo"}
 
 
+def _has_text_history(widget, name):
+    history = widget if isinstance(widget, QLineEdit) else widget.document()
+    return history.isUndoAvailable() if name == "undo" else history.isRedoAvailable()
+
+
 class MenuRouter:
     def __init__(self, controller):
         self.controller = controller
 
     def local_target(self, name):
+        if name not in TEXT_ACTIONS:
+            return None
         widget = QApplication.focusWidget()
         while widget is not None:
             if isinstance(widget, (QLineEdit, QPlainTextEdit, QTextEdit)):
-                return widget if name in TEXT_ACTIONS else None
+                # After the source editor's local history runs out, the deck's
+                # Undo/Redo is available again unless a draft still blocks it.
+                if (widget is getattr(self.controller, "source_view", None) and name in {"undo", "redo"}
+                        and not _has_text_history(widget, name)):
+                    return None
+                return widget
             widget = widget.parentWidget()
         return None
 
@@ -80,8 +92,7 @@ class MenuRouter:
         handler = getattr(controller, name, None)
         if not callable(handler):
             raise AttributeError(f"Manimble command {name!r} is not implemented by {type(controller).__name__}")
-        argument = sender.data() if name == "export_slide_movie" and sender is not None else sender
-        result = handler(argument) if sender is not None else handler()
+        result = handler(sender) if sender is not None else handler()
         if inspect.isgenerator(result):
             return spawn(result, name=name)
         return result
@@ -101,8 +112,7 @@ def validate_action(c, name, action):
     target = local.local_target(name) if local else None
     if target is not None:
         if name in {"undo", "redo"}:
-            document = target.document() if hasattr(target, "document") else None
-            return (document.isUndoAvailable() if name == "undo" else document.isRedoAvailable()) if document else True
+            return _has_text_history(target, name)
         if name in {"copy", "cut"}:
             return target.textCursor().hasSelection() if hasattr(target, "textCursor") else target.hasSelectedText()
         return True
@@ -115,9 +125,13 @@ def validate_action(c, name, action):
     canvas = getattr(c, "canvas", None)
     scene = getattr(c, "scene", None) or {}
     selected = list(getattr(canvas, "selected_ids", []))
-    editing = getattr(c, "scene_name", None) is not None and getattr(c, "player", None) is None
+    has_scene = getattr(c, "scene_name", None) is not None
+    still = getattr(c, "player", None) is not None
+    presenter = getattr(c, "presenter", None) is not None
+    animated = getattr(c, "animated_player", None) is not None
+    editing = has_scene and not still
     unused = bool(getattr(c, "selected_slide_is_unused", False))
-    playing = any(getattr(c, n, None) is not None for n in ("player", "presenter", "animated_player"))
+    playing = still or presenter or animated
     scenes = bool(state.get("scenes"))
     kind, fmt = obj.get("kind"), obj.get("format") or {}
     data = action.data()
@@ -137,23 +151,25 @@ def validate_action(c, name, action):
         move = getattr(c, "last_build_move", None)
         return bool(move and move[0] == getattr(c, "scene_name", None) and move[2] == getattr(c, "stop_index", 0))
     if name in {"format_bold", "format_italic"}:
-        action.setChecked(str(obj.get("weight" if name == "format_bold" else "slant", "")).upper() in ("BOLD", "ITALIC", "OBLIQUE"))
         return kind == "text"
     if name in {"format_underline", "format_strikethrough", "highlight_chosen"}:
         value = fmt.get({"format_underline": "underline", "format_strikethrough": "strike", "highlight_chosen": "highlight"}[name])
-        action.setChecked(value == data if name == "highlight_chosen" else bool(value))
+        if name == "highlight_chosen":
+            action.setChecked((value.upper() if value is not None else None) == (data.upper() if data is not None else None))
+        else:
+            action.setChecked(bool(value))
         return kind in {"text", "tex"}
     if name in {"format_bigger", "format_smaller", "clear_formatting", "hyperlink_pressed"}:
         return kind in {"text", "tex"}
     if name in {"format_superscript", "format_subscript", "toggle_bullets", "toggle_numbering", "increase_indent", "decrease_indent"}:
         return kind == "text" and obj.get("textOk") is True
     if name in {"align_left", "align_center", "align_right", "align_justify", "spacing_menu_chosen", "columns_menu_chosen"}:
-        if name.startswith("align_"):
-            action.setChecked(fmt.get("align", "left") == name[6:])
+        if name in {"align_left", "align_center", "align_right"}:
+            action.setChecked(fmt.get("align") == name[6:])
         if name == "columns_menu_chosen":
             action.setChecked(fmt.get("columns", 1) == data)
         return kind == "text"
-    toggles = {"toggle_objects": (canvas, "show_objects"), "toggle_grid": (canvas, "show_grid"),
+    toggles = {"toggle_grid": (canvas, "show_grid"),
                "toggle_snap": (canvas, "snap_enabled"), "toggle_ruler": (c, "show_ruler"),
                "toggle_tips": (c, "show_tips"), "toggle_unused_slides": (c, "show_unused_slides"),
                "toggle_notes_pane": (c, "drawer_shows_notes")}
@@ -162,7 +178,7 @@ def validate_action(c, name, action):
         action.setChecked(bool(getattr(owner, attr, False)))
         return getattr(c, "workspace", None) is not None if name in {"toggle_unused_slides", "toggle_notes_pane"} else True
     if name in {"add_vertical_guide", "add_horizontal_guide"}:
-        return editing
+        return has_scene
     if name == "clear_guides":
         return bool(getattr(canvas, "user_guides", []))
     if name == "draw_tool_menu":
@@ -185,14 +201,19 @@ def validate_action(c, name, action):
         return editing and unused
     if name == "toggle_expand_all_builds":
         action.setText("Collapse All Builds" if getattr(c, "builds_expanded_all", False) else "Expand All Builds")
-        return bool(state.get("scenes") or state.get("unusedScenes")) and not playing
+        return bool(c.navigator_scenes) and not still
     if name == "extract_elements_pressed":
         return editing and kind == "image" and bool(obj.get("imagePath")) and not obj["imagePath"].lower().endswith(".svg")
-    if name in {"slide_numbers_pressed", "apply_dark_mode", "apply_invert_colors"}:
+    if name == "slide_numbers_pressed":
+        return scenes and not still
+    if name in {"apply_dark_mode", "apply_invert_colors"}:
         return scenes and not playing
     if name == "toggle_terminal":
         action.setText("Hide Terminal" if getattr(c, "drawer_shows_terminal", False) else "Show Terminal")
         return getattr(c, "workspace", None) is not None
+    if name == "toggle_engine_log":
+        action.setChecked(c.drawer_open and c.drawer.page == "log")
+        return True
     if name in {"new_terminal", "split_terminal", "export_python_pressed", "save_to_original", "save_project_folder_pressed", "package_project_pressed", "revert_to_original"}:
         return getattr(c, "workspace", None) is not None
     if name == "toggle_terminal_in_work_copy":
@@ -206,14 +227,18 @@ def validate_action(c, name, action):
     if name == "toggle_show_animations":
         action.setText("Hide Animations" if getattr(c, "show_animations", False) else "Show Animations")
         return True
-    if name == "play_menu_presenter":
-        return scenes and not playing and (not getattr(c, "show_animations", False) or editing)
-    if name in {"play_menu_from_beginning", "auto_present_from_beginning", "export_movie"}:
+    if name in {"play_menu_from_beginning", "play_menu_from_current", "play_menu_presenter"}:
+        if getattr(c, "show_animations", False):
+            return not playing and (scenes if name == "play_menu_from_beginning" else has_scene)
+        if name == "play_menu_from_current":
+            return editing
+        return scenes and not still and not presenter
+    if name == "auto_present_from_beginning":
         return scenes and not playing
-    if name == "export_slide_movie":
-        return any(s["name"] == data and not s.get("hidden") for s in state.get("scenes", [])) and not playing
-    if name in {"play_menu_from_current", "auto_present_from_current"}:
+    if name == "auto_present_from_current":
         return editing and not playing
+    if name == "export_movie":
+        return scenes and not still and not animated
     if name == "play_current_slide_animations":
         return editing and getattr(c, "source_draft", None) is None and getattr(c, "preview_scene", None) is None
     if name == "animation_resolution_chosen":
@@ -221,11 +246,13 @@ def validate_action(c, name, action):
         return not playing and getattr(c, "preview_scene", None) is None
     if name == "theme_chosen":
         action.setChecked(scene.get("theme") == action.text())
-        return editing
+        return has_scene
     if name in {"undo", "redo"}:
         return getattr(c, "source_draft", None) is None and bool(state.get("canUndo" if name == "undo" else "canRedo", True))
     if name.startswith("insert_") or name in {"format_background", "show_bio_cartoon"}:
         return editing
+    if name == "clear_recent":
+        return bool(data)
     return True
 
 
@@ -307,8 +334,9 @@ def register_actions(controller, registry=None):
     section("Insert", [("Image…", "insert_image_pressed", "Ctrl+Shift+I"), ("Python Plot…", "insert_python_plot_pressed"),
         ("Extract Elements from Image…", "extract_elements_pressed"), None, ("Slide Numbers…", "slide_numbers_pressed")])
     for title, layout in LAYOUTS:
-        add("Slide/New Slide", title, "new_slide_layout", "Ctrl+Shift+N" if layout == "title_content" else None,
-            value=layout, id=f"new_slide_layout:{layout}")
+        action = add("Slide/New Slide", title, "new_slide_layout", "Ctrl+Shift+N" if layout == "title_content" else None,
+                     value=layout, id=f"new_slide_layout:{layout}")
+        action.setIcon(layout_icon(layout))
     section("Slide", [("New Build", "new_build"), ("Duplicate Slide", "duplicate_slide", "Ctrl+D"),
         ("Delete Slide", "delete_slide", "Ctrl+Shift+Backspace"), ("Hide Slide", "toggle_hide_slide", "Ctrl+Shift+H"),
         ("Restore Slide to Show", "restore_slide"), None, ("Move Slide Up", "move_slide_up", "Ctrl+Alt+Up"),
@@ -317,7 +345,7 @@ def register_actions(controller, registry=None):
     for title, name, key in (("Bold", "format_bold", "Ctrl+B"), ("Italic", "format_italic", "Ctrl+I"),
                              ("Underline", "format_underline", "Ctrl+U"), ("Strikethrough", "format_strikethrough", None),
                              ("Superscript", "format_superscript", "Ctrl+Shift++"), ("Subscript", "format_subscript", "Ctrl+Shift+_")):
-        add("Format", title, name, key, check=name in {"format_bold", "format_italic", "format_underline", "format_strikethrough"})
+        add("Format", title, name, key, check=name in {"format_underline", "format_strikethrough"})
     section("Format", [None, ("Bigger", "format_bigger", "Ctrl+Alt+="), ("Smaller", "format_smaller", "Ctrl+Alt+-")])
     for title, color in HIGHLIGHTS:
         add("Format/Highlight", title, "highlight_chosen", value=color, id=f"highlight:{title}", check=True)
@@ -326,7 +354,7 @@ def register_actions(controller, registry=None):
         ("Increase Indent", "increase_indent", "Ctrl+Shift+]"), ("Decrease Indent", "decrease_indent", "Ctrl+Shift+["), None])
     for title, name, key in (("Align Left", "align_left", "Ctrl+L"), ("Center", "align_center", "Ctrl+E"),
                              ("Align Right", "align_right", "Ctrl+R"), ("Justify", "align_justify", "Ctrl+J")):
-        add("Format", title, name, key, check=True)
+        add("Format", title, name, key, check=name != "align_justify")
     for value in (1.0, 1.15, 1.5, 2.0, 2.5, 3.0, None):
         add("Format/Line Spacing", "Custom…" if value is None else str(value), "spacing_menu_chosen", value=value)
     for i, title in enumerate(("One", "Two", "Three", "Four"), 1):
@@ -343,7 +371,7 @@ def register_actions(controller, registry=None):
         ("Apply Move to All Builds", "spread_last_move", "Ctrl+Shift+A")])
     for title, name, key in (("Show Objects", "toggle_objects", "Ctrl+Alt+J"), ("Grid Lines", "toggle_grid", "Ctrl+Alt+G"),
                              ("Ruler", "toggle_ruler", "Ctrl+Alt+U"), ("Snap to Objects", "toggle_snap", "Ctrl+Alt+S")):
-        add("View", title, name, key, check=True)
+        add("View", title, name, key, check=name != "toggle_objects")
     section("View", [("Add Vertical Guide", "add_vertical_guide"), ("Add Horizontal Guide", "add_horizontal_guide"), ("Clear Guides", "clear_guides")])
     add("View", "Show Unused Slides", "toggle_unused_slides", check=True)
     add("View", "Speaker Notes", "toggle_notes_pane", "Ctrl+Alt+K", check=True)
@@ -355,6 +383,7 @@ def register_actions(controller, registry=None):
     section("View", [None, ("Zoom In", "zoom_in", "Ctrl+="), ("Zoom Out", "zoom_out", "Ctrl+-"), ("Fit in Window", "zoom_fit", "Ctrl+0"), None,
         ("Show Terminal", "toggle_terminal", "Ctrl+Alt+T"), ("New Terminal", "new_terminal", "Ctrl+Alt+Shift+T"), ("Split Terminal", "split_terminal", "Ctrl+\\")])
     add("View", "Terminal Starts in Working Copy", "toggle_terminal_in_work_copy", check=True)
+    add("View", "Engine Log", "toggle_engine_log", check=True)
     section("View", [None, ("Hide/Show Slide Navigator", "toggle_navigator", "Ctrl+Alt+N"),
         ("Hide/Show Inspector and Source", "toggle_inspector", "Ctrl+Alt+I"), ("Auxiliary Pane", "toggle_pane_overlay", "Ctrl+Alt+F12")])
     section("Play", [("Show Animations", "toggle_show_animations", "Ctrl+Alt+A"), None,
@@ -368,7 +397,6 @@ def register_actions(controller, registry=None):
     # Toolbar/context-only commands still share the same registry.
     add(None, "New Slide", "new_slide")
     add(None, "Expand All Builds", "toggle_expand_all_builds")
-    add(None, "Export Slide as Movie…", "export_slide_movie", value=None, id="export_slide_movie")
     add(None, "Share PDF (one page per slide)…", "share_chosen", value=0, id="share_pdf:slides")
     add(None, "Share PDF (every build)…", "share_chosen", value=1, id="share_pdf:builds")
     controller.bound_menu_names = tuple(sorted(bound | {"open_recent"}))
@@ -396,8 +424,21 @@ def build_menus(controller, registry=None):
                 menu.addAction(registry.action(value))
             else:
                 menu.addSeparator()
+    layouts = menus["Slide/New Slide"]
+    set_menu_icon_size(layouts, LAYOUT_ICON_SIZE)
+
+    def refresh_layouts():
+        background = getattr(controller.canvas, "shown_background", None) or "#FFFFFF"
+        for _, layout in LAYOUTS:
+            registry.action(f"new_slide_layout:{layout}").setIcon(layout_icon(layout, background))
+
+    layouts.aboutToShow.connect(refresh_layouts)
+    if "Format/Theme" in menus:
+        set_menu_icon_size(menus["Format/Theme"], THEME_SWATCH_SIZE)
     controller.menus = menus
     recent = menus["File/Open Recent"]
+    recent.setToolTipsVisible(True)
+    set_menu_icon_size(recent, QSize(16, 16))
     recent.aboutToShow.connect(lambda: _populate_recents(controller, recent))
     return menus
 
@@ -406,11 +447,15 @@ def _populate_recents(controller, menu):
     menu.clear()
     from .projects import RecentDecks
     paths = RecentDecks.paths(getattr(controller, "settings", None))
-    for path in paths[:10]:
+    provider = QFileIconProvider()
+    for path in paths[:RecentDecks.limit]:
         p = Path(path)
-        if not p.exists():
+        info = QFileInfo(str(p))
+        if not info.exists():
             continue
-        action = menu.addAction(f"{p.parent.name} / {p.name}")
+        title = f"{p.parent.name} / {p.name}".replace("&", "&&")
+        action = menu.addAction(provider.icon(info), title)
+        action.setIconVisibleInMenu(True)
         action.setData(str(p))
         action.setToolTip(str(p))
         action.triggered.connect(lambda _=False, a=action: controller._menu_router.invoke("open_recent", a))
@@ -418,6 +463,7 @@ def _populate_recents(controller, menu):
     if has_paths:
         menu.addSeparator()
     clear = controller.actions.action("clear_recent")
+    clear.setData(has_paths)
     clear.setEnabled(has_paths)
     menu.addAction(clear)
 

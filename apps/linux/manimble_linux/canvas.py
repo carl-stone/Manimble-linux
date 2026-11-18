@@ -8,6 +8,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from dataclasses import dataclass
 from enum import IntEnum
+from functools import lru_cache
 from math import atan2, cos, hypot, pi, sin, sqrt
 from pathlib import Path
 import logging
@@ -230,6 +231,11 @@ class CanvasGeometry:
         hits = [(hypot(x - px, y - py), h) for h, px, py in candidates if abs(x - px) <= tol and abs(y - py) <= tol]
         return min(hits, key=lambda v: v[0])[1] if hits else None
 
+    def line_end_at(self, p, ends):
+        x, y = xy(p)
+        reach = 10 * self.px_per_point
+        return next((i for i in range(2) if hypot(x - ends[2*i], y - ends[2*i+1]) <= reach), None)
+
     def snap_delta(self, oid, b, dx, dy):
         if self.stop is None:
             return dx, dy, []
@@ -334,15 +340,58 @@ class CanvasGeometry:
 # Pure geometry remains importable without Qt (e.g. the macOS portability checks).
 try:
     from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
-    from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetricsF, QImage, QLinearGradient, QPainter,
-                              QPainterPath, QPen, QTransform, QTextCursor, QTextFormat, QTextCharFormat, QTextBlockFormat)
+    from PySide6.QtGui import (QBrush, QColor, QFont, QFontMetricsF, QGradient, QImage, QLinearGradient, QPainter,
+                              QPainterPath, QPalette, QPen, QRadialGradient, QTransform, QTextCursor, QTextFormat, QTextCharFormat, QTextBlockFormat)
     from PySide6.QtWidgets import QGraphicsItem, QGraphicsScene, QGraphicsView, QTextEdit, QPushButton, QFrame
 except ImportError:
     QGraphicsView = None
 
 
 if QGraphicsView is not None:
-    from .style import Theme
+    from .fonts import display_family
+    from .icons import template_icon
+    from .style import Theme, is_dark, watch_appearance
+    from .tasks import when_done
+
+    def _smoothstep(t):
+        return t * t * (3 - 2 * t)
+
+
+    @lru_cache(maxsize=2)
+    def _stage_paints(dark):
+        """CanvasView.swift's normalized stage and shadow gradients, in view units."""
+        top, bottom = ((.205, .210, .255), (.085, .088, .112)) if dark else ((.955, .955, .963), (.900, .900, .912))
+        base = QLinearGradient(0, 0, 0, 1)
+        base.setCoordinateMode(QGradient.CoordinateMode.ObjectMode)
+        base.setColorAt(0, QColor.fromRgbF(*top))
+        base.setColorAt(1, QColor.fromRgbF(*bottom))
+
+        vignette = QRadialGradient(.5, .575, .85)
+        strength = .38 if dark else .05
+        for i in range(17):
+            t = i / 16
+            vignette.setColorAt((.15 + .70 * t) / .85, QColor.fromRgbF(0, 0, 0, strength * _smoothstep(t)))
+
+        alpha = .62 if dark else .16
+        fade = [(i / 16, QColor.fromRgbF(0, 0, 0, alpha * (1 - _smoothstep(i / 16)) ** 2)) for i in range(17)]
+        shadow = []
+        for row in range(3):
+            for col in range(3):
+                x, y = int(col == 0), int(row == 0)
+                if row == col == 1:
+                    shadow.append(QBrush(fade[0][1]))
+                    continue
+                if row == 1:
+                    grad = QLinearGradient(x, 0, 1 - x, 0)
+                elif col == 1:
+                    grad = QLinearGradient(0, y, 0, 1 - y)
+                else:
+                    grad = QRadialGradient(x, y, 1)
+                grad.setCoordinateMode(QGradient.CoordinateMode.ObjectMode)
+                grad.setStops(fade)
+                shadow.append(QBrush(grad))
+        outline = QPen(QColor.fromRgbF(1, 1, 1, .16) if dark else QColor.fromRgbF(0, 0, 0, .10), 1)
+        return QBrush(base), QBrush(vignette), shadow, outline
 
     @dataclass
     class InlineEdit:
@@ -350,7 +399,7 @@ if QGraphicsView is not None:
         view: object
         center: object
         font_px: float
-        family: str | None
+        family: str
         bold: bool
         italic: bool
         original: str
@@ -382,6 +431,10 @@ if QGraphicsView is not None:
 
         def keyPressEvent(self, ev):
             key = ev.key()
+            # The previous editor may remain visible while its queued edit renders.
+            if self.isReadOnly():
+                ev.accept()
+                return
             if key == Qt.Key.Key_Escape:
                 self.canvas.finish_text_edit(False); return
             if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
@@ -509,14 +562,18 @@ if QGraphicsView is not None:
             self._space_pan = False
             self._layout_busy = False
             self._corner_oid = None
-            self._corner_button = QPushButton("▶", self.viewport())
+            self._corner_button = QPushButton(self.viewport())
+            self._corner_button.setAccessibleName("Run again")
+            self._corner_button.setIcon(template_icon("play.fill", tint=QColor("white")))
             self._python_button = QPushButton("py", self.viewport())
+            self._python_button.setAccessibleName("Open Python code")
+            self._python_button.setFont(Theme.font(11, QFont.Weight.Black))
             for button, cb in ((self._corner_button, "on_corner_action"), (self._python_button, "on_corner_edit")):
                 button.setFixedSize(26, 26)
-                button.setStyleSheet("QPushButton {border: none; border-radius: 13px; color: white; background: #FF6C0C; font-weight: bold;}")
+                button.setStyleSheet("QPushButton {border: none; border-radius: 13px; color: white; background: rgba(255, 108, 12, 235);}")
                 button.clicked.connect(lambda checked=False, key=cb: self._emit(key, self._corner_oid) if self._corner_oid is not None else None)
                 button.hide()
-            self._corner_button.setToolTip("Run the plot's code again")
+            self._corner_button.setToolTip("Run the plot's code again and show what it draws now")
             self._python_button.setToolTip("Open the plot's Python code")
             self.setScene(QGraphicsScene(self))
             self._item = _CanvasItem(self)
@@ -530,6 +587,10 @@ if QGraphicsView is not None:
             self.setAcceptDrops(True)
             self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
             self._ready = True
+            watch_appearance(self._repaint_stage)
+
+        def _repaint_stage(self):
+            self.viewport().update()
 
         def __setattr__(self, name, value):
             ready = getattr(self, "_ready", False)
@@ -556,6 +617,9 @@ if QGraphicsView is not None:
                 if name == "draw_tool":
                     if value is None:
                         self._anchor_host = self._snap_anchor = None
+                        self.viewport().unsetCursor()
+                    else:
+                        self.viewport().setCursor(Qt.CursorShape.CrossCursor)
                     self._emit("on_draw_tool_change")
 
         def _emit(self, name, *args):
@@ -752,8 +816,8 @@ if QGraphicsView is not None:
             self._changed()
 
         def begin_guide_drag(self, vertical, pos):
-            self.user_guides = list(self.user_guides) + [(vertical, pos)]
-            self._drag_guide = len(self.user_guides)-1
+            self._drag_guide = len(self.user_guides)
+            self.user_guides = [*self.user_guides, (vertical, pos)]
 
         def continue_guide_drag(self, index):
             if 0 <= index < len(self.user_guides):
@@ -781,14 +845,36 @@ if QGraphicsView is not None:
             x, y = xy(p)
             return next((i for i, g in enumerate(self.user_guides) if abs((x if guide(g)[0] else y)-guide(g)[1]) <= 5*self.px_per_point), None)
 
+        def _paint_stage(self, p, r):
+            base, vignette, shadow, outline = _stage_paints(is_dark())
+            view = self.sceneRect()
+            p.fillRect(view, base)
+            p.save()
+            p.scale(view.width(), view.height() / 1.15)
+            p.fillRect(QRectF(0, 0, 1, 1.15), vignette)
+            p.restore()
+
+            p.save()
+            if self.stop is not None:
+                # The backdrop and editor depth are not part of the rendered slide.
+                outside = QPainterPath()
+                outside.addRect(view)
+                outside.addRect(r)
+                p.setClipPath(outside, Qt.ClipOperation.IntersectClip)
+            drop = r.translated(0, 14)
+            margin = 46
+            xs = (drop.left() - margin, drop.left(), drop.right(), drop.right() + margin)
+            ys = (drop.top() - margin, drop.top(), drop.bottom(), drop.bottom() + margin)
+            for i, brush in enumerate(shadow):
+                row, col = divmod(i, 3)
+                p.fillRect(QRectF(xs[col], ys[row], xs[col + 1] - xs[col], ys[row + 1] - ys[row]), brush)
+            p.restore()
+            p.setPen(outline)
+            p.drawRect(r.adjusted(-.5, -.5, .5, .5))
+
         def _paint(self, p):
-            gradient = QLinearGradient(0, 0, 0, self.viewport().height())
-            gradient.setColorAt(0, Theme.canvas_top()); gradient.setColorAt(1, Theme.canvas_bottom())
-            p.fillRect(self.sceneRect(), gradient)
             r = self.slide_rect
-            for spread in range(15, 0, -1):
-                p.fillRect(r.adjusted(-spread, -spread+5, spread, spread+5), QColor(0, 0, 0, 2))
-            p.setPen(QPen(Theme.ink(.15), 1)); p.drawRect(r.adjusted(-.5, -.5, .5, .5))
+            self._paint_stage(p, r)
             p.save()
             p.translate(r.topLeft()); p.scale(self.effective_scale, self.effective_scale)
             bounds = QRectF(0, 0, *self.frame_size)
@@ -869,63 +955,107 @@ if QGraphicsView is not None:
                 return
             k = self.px_per_point; fw, fh = self.frame_size
             accent = Theme.accent
+            faint = QColor(accent); faint.setAlphaF(.35)
+            glow = QColor(accent); glow.setAlphaF(.95)
+            white = QColor(Qt.GlobalColor.white)
+            th = max(1., 1.4*k)
+
+            def outline(b, color=accent, width=th):
+                if b is None:
+                    return
+                # Keep all four edges inside the reference box.
+                tw, lh = min(width, b.w), min(width, b.h)
+                p.fillRect(QRectF(b.x0, b.y0, b.w, lh), color)
+                p.fillRect(QRectF(b.x0, b.y1-lh, b.w, lh), color)
+                p.fillRect(QRectF(b.x0, b.y0, tw, b.h), color)
+                p.fillRect(QRectF(b.x1-tw, b.y0, tw, b.h), color)
+
+            def rule(vertical, pos, color, width):
+                rect = QRectF(pos-width/2, 0, width, fh) if vertical else QRectF(0, pos-width/2, fw, width)
+                p.fillRect(rect, color)
+
+            def disc(x, y, radius, fill, ring, fraction):
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(ring)
+                p.drawEllipse(QPointF(x,y),radius,radius)
+                p.setBrush(fill)
+                inner = radius*(1-fraction)
+                p.drawEllipse(QPointF(x,y),inner,inner)
+
             p.setBrush(Qt.BrushStyle.NoBrush)
-            def outline(b, color=accent, width=1.4):
-                if b is not None:
-                    p.setPen(QPen(color, width*k)); p.setBrush(Qt.BrushStyle.NoBrush)
-                    p.drawRect(QRectF(b.x0, b.y0, b.w, b.h))
-            def segment(x0, y0, x1, y1, color, width=1):
-                p.setPen(QPen(color, width*k)); p.drawLine(QPointF(x0, y0), QPointF(x1, y1))
             if self.show_grid and self.unit_px > 4:
+                axis = QColor(accent); axis.setAlphaF(.55)
+                minor = QColor.fromRgbF(1., 1., 1., .13)
+                width = max(1., .8*k)
                 for vertical, extent in ((True, fw), (False, fh)):
                     n = int(extent/self.unit_px/2)+1
                     for i in range(-n, n+1):
                         pos = extent/2+i*self.unit_px
                         if 0 <= pos <= extent:
-                            color = QColor("#FF6C0C") if i == 0 else QColor(255, 255, 255, 34)
-                            segment(pos, 0, pos, fh, color, .8) if vertical else segment(0, pos, fw, pos, color, .8)
+                            rule(vertical, pos, axis if i == 0 else minor, width)
             for i, g in enumerate(self.user_guides):
-                vertical, pos = guide(g); c = QColor(64, 217, 255, 255 if i == self._drag_guide else 204)
-                segment(pos, 0, pos, fh, c, 2 if i == self._drag_guide else 1.4) if vertical else segment(0, pos, fw, pos, c, 1.4)
+                vertical, pos = guide(g); active = i == self._drag_guide
+                rule(vertical, pos, QColor.fromRgbF(.25, .85, 1., 1. if active else .8), 1.5*th if active else th)
             for vertical, pos in self._guides:
-                segment(pos, 0, pos, fh, accent, 1.4) if vertical else segment(0, pos, fw, pos, accent, 1.4)
-            color = DarkMode.map(QColor(self.pen_color), m=self.color_view)
-            p.setPen(QPen(color, max(1.5, self.pen_width*.01*self.unit_px), Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
-            for points in list(self.pending_strokes) + ([self._pen_points] if self._pen_points else []):
-                if not points:
-                    continue
-                path = QPainterPath(QPointF(*xy(points[0])))
-                for point in points[1:]:
-                    path.lineTo(QPointF(*xy(point)))
-                p.drawPath(path)
+                rule(vertical, pos, glow, th)
+            if self.pending_strokes or self._pen_points:
+                color = DarkMode.map(QColor(self.pen_color), m=self.color_view)
+                width = max(1.5, self.pen_width*.01*self.unit_px)
+                p.setPen(QPen(color, width, Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin))
+                for points in (*self.pending_strokes, self._pen_points):
+                    if not points:
+                        continue
+                    start = QPointF(*xy(points[0]))
+                    if len(points) == 1:
+                        p.drawPoint(start)
+                        continue
+                    path = QPainterPath(start)
+                    for i in range(1, len(points)):
+                        path.lineTo(QPointF(*xy(points[i])))
+                    p.drawPath(path)
             if self._draw_band:
                 x0, y0, x1, y1 = self._draw_band
                 if self.draw_tool in self.line_tools:
-                    segment(x0, y0, x1, y1, accent, 3)
+                    p.setPen(QPen(accent, max(2., 3*k), Qt.PenStyle.SolidLine, Qt.PenCapStyle.FlatCap))
+                    p.drawLine(QPointF(x0, y0), QPointF(x1, y1))
                 else:
-                    outline(Box(min(x0,x1), min(y0,y1), max(x0,x1), max(y0,y1)), width=2)
+                    outline(Box(min(x0,x1), min(y0,y1), max(x0,x1), max(y0,y1)), width=1.4*th)
             if self._anchor_host is not None:
                 for at, x, y in self.anchor_points(self._anchor_host):
                     on = self._snap_anchor is not None and self._snap_anchor.oid == self._anchor_host and self._snap_anchor.at == at
-                    radius = (5.5 if on else 3.5)*k
-                    p.setBrush(accent if on else QColor("white")); p.setPen(QPen(accent, 1.4*k))
-                    p.drawEllipse(QPointF(x, y), radius, radius)
+                    disc(x, y, (5.5 if on else 3.5)*k, accent if on else white, white if on else accent, .35)
             for ph in self.placeholders:
                 if self._inline is not None and self._inline.placeholder == field(ph, "line"):
                     continue
                 b = as_box(field(ph, "rect")); light = self.shown_light(b)
-                p.setPen(QPen(QColor("#8C8C8C") if light else QColor("#999999"), 1.2*k, Qt.PenStyle.DashLine))
-                p.setBrush(Qt.BrushStyle.NoBrush); p.drawRect(QRectF(b.x0,b.y0,b.w,b.h))
-                font = QFont(); font.setPixelSize(max(1, round(field(ph,"size",24)/72*self.unit_px)))
+                grey = .55 if light else .6
+                border = QColor.fromRgbF(grey, grey, grey, .9)
+                dash, interval, width = 5*k, 8.5*k, max(1., 1.2*k)
+                x = b.x0
+                while x < b.x1:
+                    length = min(dash, b.x1-x)
+                    p.fillRect(QRectF(x,b.y0,length,width), border)
+                    p.fillRect(QRectF(x,b.y1-width,length,width), border)
+                    x += interval
+                y = b.y0
+                while y < b.y1:
+                    length = min(dash, b.y1-y)
+                    p.fillRect(QRectF(b.x0,y,width,length), border)
+                    p.fillRect(QRectF(b.x1-width,y,width,length), border)
+                    y += interval
+                # Prompt uses the UI face but its size comes from the Manim layout.
+                font = Theme.font(1); font.setPixelSize(max(1, round(field(ph,"size",24)/72*self.unit_px)))
+                grey = .45 if light else .62
+                p.setPen(QColor.fromRgbF(grey, grey, grey))
                 p.setFont(font)
                 anchor = self.placeholder_anchor(ph)
                 metrics = QFontMetricsF(font); height = metrics.height()
                 p.drawText(QPointF(anchor.x, anchor.y + metrics.ascent() - (0 if anchor.top else height/2)), field(ph,"prompt","Click to add text"))
-            outline(self._wrap_band, width=2)
+            outline(self._wrap_band, width=1.4*th)
             if self.ghost:
                 g = self.ghost
                 cx, cy, w, h = (g["cx"],g["cy"],g["w"],g["h"]) if isinstance(g,dict) else g[1:]
-                outline(Box(cx-w/2,cy-h/2,cx+w/2,cy+h/2), width=2)
+                outline(Box(cx-w/2,cy-h/2,cx+w/2,cy+h/2), width=1.6*th)
             marks = self.find_marks() if callable(self.find_marks) else self.find_marks or []
             for mark in marks:
                 oid = field(mark,"oid")
@@ -941,26 +1071,31 @@ if QGraphicsView is not None:
                     current = field(mark,"current",False)
                     p.fillRect(rect, QColor(255,158,10,107) if current else QColor(255,214,25,77))
                     if current:
-                        outline(Box(rect.left(),rect.top(),rect.right(),rect.bottom()))
-            for v in self.stop.get("visible", []):
-                oid = int(v[0])
-                if oid in self.selected_ids:
-                    outline(self.current_box(oid), width=2.2)
-                elif self.show_objects or oid == self.hover:
-                    color = QColor(accent); color.setAlphaF(.95 if oid == self.hover else .35)
-                    outline(self.current_box(oid), color, 2 if oid == self.hover else 1)
+                        outline(Box(rect.left(),rect.top(),rect.right(),rect.bottom()), QColor.fromRgbF(.96, .5, 0., .95))
+            selected = set(self.selected_ids)
+            if self.show_objects:
+                for v in self.stop.get("visible", []):
+                    oid = int(v[0])
+                    if oid not in selected:
+                        outline(self.current_box(oid), glow if oid == self.hover else faint, th*(1.4 if oid == self.hover else .7))
+            elif self.hover is not None and self.hover not in selected:
+                outline(self.current_box(self.hover), glow, 1.4*th)
+            for oid in selected:
+                outline(self.current_box(oid), width=1.6*th)
             if self.selection is not None and (b := self.current_box(self.selection)) is not None:
                 ends = self.line_ends(self.selection)
                 points = [(ends[0], ends[1]), (ends[2], ends[3])] if ends else [(b.x0,b.y0),(b.x1,b.y0),(b.x0,b.y1),(b.x1,b.y1)]
                 if self.wrappable(self.selection):
                     side = self._wrap_band or b
                     points += [(side.x0,b.cy),(side.x1,b.cy)]
-                p.setBrush(QColor("white")); p.setPen(QPen(accent, 2*k))
                 for x, y in points:
-                    p.drawEllipse(QPointF(x,y),6.5*k,6.5*k)
+                    disc(x, y, 6.5*k, white, accent, .28)
             if self._marquee is not None:
                 b = self._marquee
-                p.fillRect(QRectF(b.x0,b.y0,b.w,b.h), QColor(255,108,12,31)); outline(b, width=1)
+                fill = QColor(accent); fill.setAlphaF(.12)
+                edge = QColor(accent); edge.setAlphaF(.9)
+                p.fillRect(QRectF(b.x0,b.y0,b.w,b.h), fill)
+                outline(b, edge, max(1., k))
 
         def snapshot(self):
             image = QImage(round(self.frame_size[0]), round(self.frame_size[1]), QImage.Format.Format_ARGB32_Premultiplied)
@@ -1023,15 +1158,14 @@ if QGraphicsView is not None:
                 self._draw_band = (*xy(p),*xy(p)); self._changed(); return
             i = self.guide_at(p)
             if i is not None:
-                self._drag_guide = i; return
+                self.continue_guide_drag(i); return
             s = self.selection
             if s is not None:
                 ends = self.line_ends(s); box = self.current_box(s)
                 if ends:
-                    for i in range(2):
-                        if hypot(p.x()-ends[2*i],p.y()-ends[2*i+1]) <= 10*self.px_per_point:
-                            self._drag_end = i; self._drag_oid = s; self._drag_start = p
-                            self.line_overrides[s] = ends; self._drag_anchor = None; return
+                    if (end := self.line_end_at(p, ends)) is not None:
+                        self._drag_end = end; self._drag_oid = s; self._drag_start = p
+                        self.line_overrides[s] = ends; self._drag_anchor = None; return
                 elif box is not None:
                     h = self.handle_at(p,box,self.wrappable(s))
                     if h is not None:
@@ -1060,6 +1194,11 @@ if QGraphicsView is not None:
             self._drag_group = {i:(self.overrides.get(i,Override()).dx,self.overrides.get(i,Override()).dy) for i in self.selected_ids if i != oid}
 
         def mouseDoubleClickEvent(self, ev):
+            if ev.button() != Qt.MouseButton.LeftButton:
+                return super().mouseDoubleClickEvent(ev)
+            if self.draw_tool is not None or self._space_pan:
+                self.mousePressEvent(ev)
+                return
             oid = self.hit(self.frame_point(ev.position()))
             if oid is not None:
                 self.select_group([oid]); self._emit("on_edit",oid,ev.position())
@@ -1141,12 +1280,23 @@ if QGraphicsView is not None:
                     self._anchor_host,self._snap_anchor = (None,None) if control else self.line_anchor(p)
                     self._changed()
                 return
-            self.hover = self.hit(p)
             i = self.guide_at(p)
             if i is not None:
                 self.viewport().setCursor(Qt.CursorShape.SizeHorCursor if guide(self.user_guides[i])[0] else Qt.CursorShape.SizeVerCursor)
-            else:
-                self.viewport().setCursor(Qt.CursorShape.OpenHandCursor if self.hover is not None else Qt.CursorShape.ArrowCursor)
+                return
+            self.hover = self.hit(p)
+            cursor = Qt.CursorShape.OpenHandCursor if self.hover is not None else Qt.CursorShape.ArrowCursor
+            if self.selection is not None:
+                oid = self.selection
+                ends = self.line_ends(oid)
+                if ends:
+                    if self.line_end_at(p, ends) is not None:
+                        cursor = Qt.CursorShape.CrossCursor
+                elif (box := self.current_box(oid)) is not None:
+                    handle = self.handle_at(p, box, self.wrappable(oid))
+                    if handle is not None:
+                        cursor = Qt.CursorShape.SizeHorCursor if handle.is_side else Qt.CursorShape.CrossCursor
+            self.viewport().setCursor(cursor)
 
         def mouseReleaseEvent(self, ev):
             if self._pan_start is not None:
@@ -1166,7 +1316,17 @@ if QGraphicsView is not None:
                     points = simplify(self._pen_points,1.2); self._pen_points = []
                     length = sum(hypot(xy(b)[0]-xy(a)[0],xy(b)[1]-xy(a)[1]) for a,b in zip(points,points[1:]))
                     if len(points)>=2 and length>=4*self.px_per_point:
-                        self.pending_strokes = list(self.pending_strokes)+[points]; self._emit("on_pen",points)
+                        self.pending_strokes = [*self.pending_strokes, points]
+                        def settled(_future=None):
+                            self.pending_strokes = [stroke for stroke in self.pending_strokes if stroke is not points]
+                        future = None
+                        try:
+                            future = self._emit("on_pen",points)
+                        finally:
+                            if future is None:
+                                settled()
+                            else:
+                                when_done(future, settled)
                     return
                 if self._draw_start is not None and self.draw_tool is not None:
                     tool,band = self.draw_tool,self._draw_band; self._draw_start = self._draw_band = None
@@ -1221,9 +1381,8 @@ if QGraphicsView is not None:
                 oid = self.hit(self.frame_point(ev.pos()))
                 if oid not in self.selected_ids:
                     self.select_with_group(oid) if oid is not None else self.select_group([])
-            menu = self._emit("on_context_menu")
-            if menu is not None:
-                menu.exec(ev.globalPos())
+            self._emit("on_context_menu", ev.globalPos())
+            ev.accept()
 
         def leaveEvent(self, ev):
             self._emit("on_cursor_move",None); self.hover = None
@@ -1242,7 +1401,11 @@ if QGraphicsView is not None:
             if key == Qt.Key.Key_Space:
                 self._space_pan = True; return
             if key == Qt.Key.Key_Escape and self.draw_tool is not None:
-                self.draw_tool = None; self._draw_start = self._draw_band = None; self._pen_points = []; self._changed(); return
+                self._draw_start = self._draw_band = None
+                self._draw_anchors = [None, None]
+                self._pen_points = []
+                self.draw_tool = None
+                return
             if key == Qt.Key.Key_A and ev.modifiers() & Qt.KeyboardModifier.ControlModifier:
                 self.select_all_objects(); return
             if self.selection is not None:
@@ -1344,7 +1507,8 @@ if QGraphicsView is not None:
             if b is None or b.w <= 0 or b.h <= 0:
                 return False
             lines = (sizing if sizing is not None else text).split("\n")
-            font = QFont(family or "DejaVu Sans"); font.setPixelSize(100)
+            family = display_family(family) if family else Theme.font(1).family()
+            font = QFont(family); font.setPixelSize(100)
             font.setBold(bold); font.setItalic(italic)
             metrics = QFontMetricsF(font)
             widest = max((metrics.horizontalAdvance(line) for line in lines),default=0)
@@ -1354,6 +1518,9 @@ if QGraphicsView is not None:
             color = DarkMode.map(QColor(color or "#FFFFFF"),m=self.color_view)
             self._editor_text_color = color
             font.setPixelSize(max(1,round(font_px*self.effective_scale)))
+            palette = tv.palette()
+            palette.setColor(QPalette.ColorRole.Text, color)
+            tv.setPalette(palette)
             tv.setFont(font); tv.setTextColor(color); tv.setPlainText(text)
             given = dict(styles or {})
             given.setdefault("bold",[[0,len(text)]] if bold else [])
@@ -1415,6 +1582,8 @@ if QGraphicsView is not None:
             done = e.done; e.done = None
             e.view.setReadOnly(True)
             cursor = e.view.textCursor(); cursor.clearSelection(); e.view.setTextCursor(cursor)
+            if e.view.hasFocus():
+                self.setFocus()
             self.committed_styles = {kind:self.char_runs(e.view,kind) for kind in e.touched} if e.touched else None
             text = e.view.toPlainText()
             def release():
@@ -1509,12 +1678,14 @@ if QGraphicsView is not None:
             self._layout_busy = True
             try:
                 tv = e.view; doc = tv.document(); scale = self.effective_scale
-                font = QFont(e.family or "DejaVu Sans"); font.setPixelSize(max(1,round(e.font_px*scale)))
+                font = QFont(e.family); font.setPixelSize(max(1,round(e.font_px*scale)))
                 # Default font changes preserve per-run bold/italic marks and undo history.
                 doc.setDefaultFont(font)
                 block = QTextBlockFormat()
                 block.setAlignment(Qt.AlignmentFlag.AlignHCenter if e.align == "center" else Qt.AlignmentFlag.AlignRight if e.align == "right" else Qt.AlignmentFlag.AlignLeft)
-                block.setLineHeight(e.font_px*scale*(1+(e.line_spacing if e.line_spacing is not None else .3)),QTextBlockFormat.LineHeightTypes.FixedHeight.value)
+                pitch = e.font_px*scale*(1+(e.line_spacing if e.line_spacing is not None else .3))
+                line_height = QFontMetricsF(font).lineSpacing()
+                block.setLineHeight(max(pitch, line_height), QTextBlockFormat.LineHeightTypes.FixedHeight.value)
                 cursor = QTextCursor(doc); cursor.select(QTextCursor.SelectionType.Document)
                 if cursor.blockFormat().alignment() != block.alignment() or abs(cursor.blockFormat().lineHeight()-block.lineHeight())>.01:
                     cursor.mergeBlockFormat(block)

@@ -5,11 +5,11 @@ from enum import Enum
 from math import ceil, floor
 
 from PySide6.QtCore import QPointF, QRectF, Qt
-from PySide6.QtGui import QColor, QFont, QPainter, QPainterPath, QPen
+from PySide6.QtGui import QColor, QFontMetricsF, QPainter, QPainterPath
 from PySide6.QtWidgets import QWidget
 
 from .canvas import guide
-from .style import Theme
+from .style import Theme, is_dark, watch_appearance
 
 
 class RulerView(QWidget):
@@ -32,6 +32,7 @@ class RulerView(QWidget):
         else:
             self.setFixedWidth(self.thickness)
         self.setToolTip("Drag down onto the slide to add a horizontal guide" if self.horizontal else "Drag right onto the slide to add a vertical guide")
+        watch_appearance(self.update)
 
     @property
     def horizontal(self):
@@ -64,13 +65,18 @@ class RulerView(QWidget):
 
     @property
     def step(self):
+        ppu, min_spacing = self.pts_per_unit, Theme.logical_size(44)
         for size in (.1,.2,.25,.5,1,2,5,10,20):
-            if size*self.pts_per_unit >= 44:
+            if size*ppu >= min_spacing:
                 return size,5 if size in (.1,.5,5,10,20) else 4
         return 50,5
 
     def _along(self, lo, hi):
         return QRectF(lo,0,hi-lo,self.height()) if self.horizontal else QRectF(0,lo,self.width(),hi-lo)
+
+    def _tick(self, pos, length, thick):
+        pos = floor(pos + .5) - .5
+        return QRectF(pos, thick - length, 1, length) if self.horizontal else QRectF(thick - length, pos, length, 1)
 
     def paintEvent(self, event):
         p = QPainter(self); p.fillRect(self.rect(),Theme.canvas_bottom())
@@ -88,26 +94,32 @@ class RulerView(QWidget):
             p.fillRect(self._along(min(a,z),max(a,z)),color)
         major,minor = self.step; spacing = major/minor; ppu = self.pts_per_unit
         center = self.center_pos
-        font = QFont("DejaVu Sans Mono"); font.setPixelSize(9); p.setFont(font)
+        p.setFont(Theme.mono(8.5))
+        metrics = QFontMetricsF(p.font(), p.device())
+        major_ink, minor_ink, label_ink = Theme.ink(.6), Theme.ink(.28), Theme.ink(.72)
         first,last = floor(-center/ppu/spacing),ceil((length-center)/ppu/spacing)
         decimals = 0 if major >= 1 else 2 if major == .25 else 1
         for i in range(first,last+1):
             pos = center+i*spacing*ppu; is_major = i%minor == 0
+            if not -1 <= pos <= length + 1:
+                continue
             tick = thick if is_major else thick*(.42 if minor%2 == 0 and i%(minor//2) == 0 else .26)
-            p.setPen(QPen(Theme.ink(.6 if is_major else .28),1))
-            if self.horizontal:
-                p.drawLine(QPointF(pos,thick-tick),QPointF(pos,thick))
-            else:
-                p.drawLine(QPointF(thick-tick,pos),QPointF(thick,pos))
+            p.fillRect(self._tick(pos, tick, thick), major_ink if is_major else minor_ink)
             if is_major:
                 value = i*spacing*(1 if self.horizontal else -1)
                 if abs(value)<spacing/1000: value=0
                 text = f"{value:.{decimals}f}"
-                p.setPen(Theme.ink(.72))
+                p.setPen(label_ink)
                 if self.horizontal:
-                    p.drawText(QPointF(pos+3,10),text)
+                    p.drawText(QPointF(pos + 3, 1 + metrics.ascent()), text)
                 else:
-                    p.save(); p.translate(10,pos-3); p.rotate(-90); p.drawText(QPointF(),text); p.restore()
+                    p.save()
+                    p.translate(thick - 1 - metrics.descent(), pos - 3)
+                    p.rotate(-90)
+                    p.drawText(QPointF(), text)
+                    p.restore()
+        guide_color = QColor.fromRgbF(.25, .85, 1.) if is_dark() else QColor.fromRgbF(0., .55, .75)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
         for g in c.user_guides:
             vertical,pos = guide(g)
             if vertical != self.horizontal:
@@ -117,13 +129,12 @@ class RulerView(QWidget):
                 path.moveTo(pos-3,thick); path.lineTo(pos+3,thick); path.lineTo(pos,thick-6)
             else:
                 path.moveTo(thick,pos-3); path.lineTo(thick,pos+3); path.lineTo(thick-6,pos)
-            path.closeSubpath(); p.fillPath(path,QColor("#40D9FF"))
+            path.closeSubpath(); p.fillPath(path, guide_color)
         if self.cursor is not None:
             pos = self.view_pos(self.cursor.x() if self.horizontal else self.cursor.y())
-            p.setPen(QPen(Theme.ink(.85),1))
-            p.drawLine(QPointF(pos,0),QPointF(pos,thick)) if self.horizontal else p.drawLine(QPointF(0,pos),QPointF(thick,pos))
-        p.setPen(QPen(Theme.ink(.14),1))
-        p.drawLine(0,self.height()-1,self.width(),self.height()-1) if self.horizontal else p.drawLine(self.width()-1,0,self.width()-1,self.height())
+            p.fillRect(self._tick(pos, thick, thick), Theme.ink(.85))
+        edge = QRectF(0, thick - 1, length, 1) if self.horizontal else QRectF(thick - 1, 0, 1, length)
+        p.fillRect(edge, Theme.separator())
 
     def guide_marker(self, point):
         if self.canvas is None:

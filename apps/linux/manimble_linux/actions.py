@@ -6,12 +6,12 @@ Every command is registered once::
             enabled=lambda: self.has_deck)
 
 and then appears wherever it is placed: ``menu`` (a top-level menu title, with ``/`` for submenus, e.g.
-``"Arrange/Align"``), ``reg.action(id)`` for toolbars and context menus. ``refresh()`` re-evaluates ``enabled`` /
-``checked`` callables (the editor calls it when its state changes and before a menu opens).
+``"Arrange/Align"``), ``reg.action(id)`` to share its presentation, or ``reg.present(id, parent)``
+for a surface with its own label, icon or help. ``refresh()`` re-evaluates ``enabled`` / ``checked``
+callables (the editor calls it when its state changes and before a menu opens).
 
-``scope``: ``"deck"`` commands are deck-editing accelerators; while the terminal has focus they are disabled, so a
-key the terminal needs (Ctrl+C, Ctrl+Z, Ctrl+D, ...) reaches the terminal instead. ``"global"`` commands keep their
-shortcuts everywhere (show/new terminal, window commands).
+``scope``: while the terminal has focus, ``"deck"`` shortcuts are removed (the commands still work by mouse)
+so keys like Ctrl+C reach the terminal. ``"global"`` commands keep their shortcuts everywhere.
 """
 
 from __future__ import annotations
@@ -19,9 +19,10 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Callable
 
-from PySide6.QtCore import QObject, Qt
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtCore import QObject, QSignalBlocker, Qt, Slot
+from PySide6.QtGui import QAction, QIcon, QKeySequence
 from PySide6.QtWidgets import QMenu, QMenuBar, QWidget
+from shiboken6 import isValid
 
 
 @dataclass
@@ -33,6 +34,36 @@ class Command:
     enabled: Callable[[], bool] | None
     checked: Callable[[], bool] | None
     shortcuts: list[QKeySequence] = field(default_factory=list)
+
+
+class _PresentationAction(QAction):
+    """An action owned by its surface, with no accelerator of its own."""
+
+    def __init__(self, command: QAction, parent: QObject, *, text, tip, icon, mirror_check):
+        super().__init__(command.icon() if icon is None else icon, command.text() if text is None else text, parent)
+        self.setToolTip(command.toolTip() if tip is None else tip)
+        self.setStatusTip(command.statusTip() if tip is None else tip)
+        self._command = command
+        self._mirror_check = mirror_check
+        command.changed.connect(self._sync_state)
+        self.triggered.connect(self._dispatch)
+        self._sync_state()
+
+    @Slot()
+    def _sync_state(self) -> None:
+        with QSignalBlocker(self):
+            self.setEnabled(self._command.isEnabled())
+            if self._mirror_check:
+                self.setCheckable(self._command.isCheckable())
+                self.setChecked(self._command.isChecked())
+
+    @Slot()
+    def _dispatch(self) -> None:
+        if self._command.isEnabled():
+            self._command.trigger()
+        # A command can open a modal sheet and outlive the context menu that owns this action.
+        if isValid(self):
+            self._sync_state()
 
 
 class ActionRegistry(QObject):
@@ -88,6 +119,16 @@ class ActionRegistry(QObject):
 
     def action(self, id: str) -> QAction:
         return self.commands[id].action
+
+    def present(self, id: str, parent: QObject, *, text: str | None = None, tip: str | None = None,
+                icon: QIcon | None = None, mirror_check: bool = True) -> QAction:
+        """Take the initial presentation (or overrides) and then mirror only command state."""
+        return _PresentationAction(self.action(id), parent, text=text, tip=tip, icon=icon, mirror_check=mirror_check)
+
+    def shortcut_text(self, id: str) -> str:
+        """The first registered shortcut in native notation, even while scoped off."""
+        shortcuts = self.commands[id].shortcuts
+        return shortcuts[0].toString(QKeySequence.SequenceFormat.NativeText) if shortcuts else ""
 
     def __contains__(self, id: str) -> bool:
         return id in self.commands
@@ -158,13 +199,3 @@ class ActionRegistry(QObject):
                 else:
                     parent.addAction(self.action(item))
         return menus
-
-    def context_menu(self, ids: list[str], parent: QWidget | None = None) -> QMenu:
-        self.refresh()
-        m = QMenu(parent or self.window)
-        for i in ids:
-            if i == self.SEPARATOR:
-                m.addSeparator()
-            elif i in self.commands:
-                m.addAction(self.action(i))
-        return m

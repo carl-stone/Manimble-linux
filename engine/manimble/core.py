@@ -24,6 +24,13 @@ from .srcedit import (BLANK_CELLS, BOX_PAD, EditError, Planner, Project, Src, _s
                       CHAR_STYLES, insert_kwarg, map_ranges, t2_literals, remove_kwargs, unwrap_soft, vec_expr, wrap_soft)
 
 HERE = Path(__file__).resolve().parent
+_LINUX_FONT_POLICY = "linux-font-policy-1"
+
+
+def _media_cache_root(cache_dir: Path) -> Path:
+    root = cache_dir / "media"
+    # Manim's cached text SVGs hash the requested family, not Fontconfig's actual match.
+    return root / _LINUX_FONT_POLICY if sys.platform.startswith("linux") else root
 
 
 # ------------------------------------------------------------------ worker
@@ -203,7 +210,7 @@ class Manimble:
         self.cache_dir = Path(cache) if cache else Path(self.deck) / ".manimble"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         (self.cache_dir / ".gitignore").write_text("*\n")
-        media_root = self.cache_dir / "media"
+        media_root = _media_cache_root(self.cache_dir)
         self.render_worker = WorkerProc(python, self.deck, "background", media_root)
         self.aux_worker = WorkerProc(python, self.deck, "auxiliary", media_root)
         self.on_event = None
@@ -347,6 +354,8 @@ class Manimble:
     def _scene_key(self, s: dict) -> str:
         """Hash of everything that can change how this scene renders."""
         h = hashlib.sha1(b"manimble-engine-6")
+        if sys.platform.startswith("linux"):
+            h.update(b"\0" + _LINUX_FONT_POLICY.encode("ascii"))
         scene_names = {x["name"] for x in self.all_scenes}
         scene_files = {x["file"] for x in self.all_scenes}
         for rel in self.project.py_files():
@@ -631,7 +640,7 @@ class Manimble:
             results = [self.results[s["name"]] for s in self.scenes if s["name"] in self.results]
         # Manimble's own output, which older render records may still list: rendered media, the workers' media
         # dirs and their shared Text/Tex SVG pool (kept with the render cache), and compiled deck modules.
-        roots = [Path(self.deck).parent / "media" / "manimble", Path(self.render_worker.media_dir).parent]
+        roots = [Path(self.deck).parent / "media" / "manimble", self.cache_dir / "media"]
         media_roots = {r for root in roots for r in (root.absolute(), root.resolve())}
 
         def generated_media(path: str) -> bool:
@@ -3932,7 +3941,9 @@ class Manimble:
     def _build_media(self, slot: int) -> str:
         """Isolate concurrent build slots; Linux also isolates slot zero from mirrored project media.
         All slots share SVGs through MANIMBLE_SHARED_MEDIA (read by slides_render.py)."""
-        return "../media" if slot == 0 and not sys.platform.startswith("linux") else str(self.cache_dir / "media" / f"build-{slot}")
+        if slot == 0 and not sys.platform.startswith("linux"):
+            return "../media"
+        return str(_media_cache_root(self.cache_dir) / f"build-{slot}")
 
     def _build_animation_slides(self, selected: list[dict], event: str, height: int = 720, progress=None) -> bool:
         """Build the selected scenes with manim where their code (or the resolution asked for) changed since the

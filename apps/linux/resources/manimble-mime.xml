@@ -3,6 +3,7 @@
   <mime-type type="application/x-manimble-project">
     <comment>Manimble project</comment>
     <sub-class-of type="application/zip"/>
+    <icon name="application-x-manimble-project"/>
     <glob pattern="*.manimble"/>
   </mime-type>
 </mime-info>

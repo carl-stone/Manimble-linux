@@ -3,11 +3,12 @@ from __future__ import annotations
 
 from collections import OrderedDict
 
-from PySide6.QtCore import Qt, QSize, QTimer
-from PySide6.QtGui import QAction, QImage
-from PySide6.QtWidgets import QListWidgetItem, QAbstractItemView, QHBoxLayout, QMenu
+from PySide6.QtCore import Qt, QSize
+from PySide6.QtGui import QImage
+from PySide6.QtWidgets import QListWidgetItem, QAbstractItemView, QMenu
 
-from .menus import LAYOUTS, validate_action
+from .icon_art import LAYOUT_ICON_SIZE, layout_icon, set_menu_icon_size
+from .menus import LAYOUTS
 from .tasks import spawn
 from .widgets import SlideTable, SlideCell, StepButton, section_label, _mapped_image
 
@@ -24,6 +25,8 @@ class NavigatorMixin:
         self.thumb_cache = OrderedDict()
         self._thumb_bytes = 0
         self._navigator_fetch_generation = 0
+        self._navigator_selection = None
+        self._navigator_menu_request = 0
         self.table.on_delete = lambda: self.delete_slide()
         self.table.on_delete_build = lambda: self.delete_build()
         self.table.on_arrow = self.step_navigator
@@ -225,10 +228,19 @@ class NavigatorMixin:
     def table_view_selection_did_change(self, row):
         if self.suppress_table or not 0 <= row < len(self.navigator_scenes):
             return
-        name = self.navigator_scenes[row]["name"]
-        if name != self.scene_name:
-            self.collapsed_builds.discard(name)
-            spawn(self.select_scene(name), name="navigator_select")
+        self._select_navigator_scene(self.navigator_scenes[row]["name"])
+
+    def _select_navigator_scene(self, name):
+        if self._navigator_selection is not None:
+            workspace, pending_name, future = self._navigator_selection
+            if workspace is self.workspace and name == pending_name and not future.done():
+                return future
+        if name == self.scene_name:
+            return None
+        self.collapsed_builds.discard(name)
+        future = spawn(self.select_scene(name), name="navigator_select").future
+        self._navigator_selection = (self.workspace, name, future)
+        return future
 
     def select_row(self, row):
         self.suppress_table = True
@@ -244,47 +256,75 @@ class NavigatorMixin:
         return True
 
     def _show_navigator_menu(self, row):
-        if not 0 <= row < len(self.navigator_scenes) or self.navigator_scenes[row]["name"] == self.scene_name:
+        self._navigator_menu_request += 1
+        request = self._navigator_menu_request
+        scenes = self.navigator_scenes
+        if self.player is not None or not scenes:
+            return None
+        if not 0 <= row < len(scenes):
             return self.navigator_menu(row)
-        name = self.navigator_scenes[row]["name"]
-        position = self.table.context_position
+        name = scenes[row]["name"]
+        # The row-change signal may already have started this load. Reuse it so the
+        # menu gets the clicked slide's build state and shown background together.
+        selection = self._select_navigator_scene(name)
+        if selection is None:
+            return self.navigator_menu(row)
+        position, workspace = self.table.context_position, self.workspace
+
         def show():
-            yield from self.select_scene(name)
-            if self.scene_name != name:
+            if (yield selection) is False:
+                return
+            if self._navigator_menu_request != request or workspace is not self.workspace or self.scene_name != name:
                 return
             current_row = next((i for i, s in enumerate(self.navigator_scenes) if s["name"] == name), -1)
+            if current_row < 0:
+                return
             menu = self.navigator_menu(current_row)
-            if menu:
-                self._navigator_context_menu = menu
+            if menu is not None:
+                menu.aboutToHide.connect(menu.deleteLater)
                 menu.popup(position)
         spawn(show(), name="navigator_context")
         return None
 
     def navigator_menu(self, row):
-        if self.player is not None or not self.navigator_scenes:
+        scenes = self.navigator_scenes
+        if self.player is not None or not scenes:
+            return None
+        clicked = scenes[row] if 0 <= row < len(scenes) else None
+        if clicked is not None and clicked["name"] != self.scene_name:
             return None
         self.actions.refresh()
         menu = QMenu(self.table)
-        if not 0 <= row < len(self.navigator_scenes):
-            menu.addAction(self.actions.action("toggle_expand_all_builds"))
+
+        def add(command):
+            menu.addAction(self.actions.present(command, menu))
+
+        if clicked is None:
+            add("toggle_expand_all_builds")
             return menu
+
         layouts = menu.addMenu("New Slide")
+        set_menu_icon_size(layouts, LAYOUT_ICON_SIZE)
+        background = self.canvas.shown_background or "#FFFFFF"
         for _, layout in LAYOUTS:
-            layouts.addAction(self.actions.action(f"new_slide_layout:{layout}"))
-        menu.addAction(self.actions.action("new_build"))
-        menu.addAction(self.actions.action("duplicate_slide"))
+            layouts.addAction(self.actions.present(f"new_slide_layout:{layout}", layouts,
+                                                   icon=layout_icon(layout, background)))
+        add("new_build")
+        add("duplicate_slide")
         menu.addSeparator()
-        name = self.navigator_scenes[row]["name"]
-        export = self.actions.action("export_slide_movie")
+        unused = row >= len((self.state or {}).get("scenes", []))
+        name = clicked["name"]
+        # This action belongs to this menu instance, not the current deck selection.
+        export = menu.addAction("Export Slide as Movie (.mp4)…")
         export.setData(name)
-        export.setEnabled(validate_action(self, "export_slide_movie", export))
-        menu.addAction(export)
+        export.setEnabled(not unused and not clicked.get("hidden") and self.animated_player is None)
+        export.triggered.connect(lambda _=False: self.export_slide_movie(name))
         menu.addSeparator()
-        menu.addAction(self.actions.action("restore_slide" if self.selected_slide_is_unused else "toggle_hide_slide"))
+        add("restore_slide" if unused else "toggle_hide_slide")
         menu.addSeparator()
-        menu.addAction(self.actions.action("toggle_expand_all_builds"))
+        add("toggle_expand_all_builds")
         menu.addSeparator()
-        menu.addAction(self.actions.action("delete_slide"))
+        add("delete_slide")
         return menu
 
     def toggle_unused_slides(self):
@@ -298,10 +338,7 @@ class NavigatorMixin:
 
     def rebuild_steps(self):
         self.refresh_build_rows()
-        bar = self.steps_bar
-        layout = bar if isinstance(bar, QHBoxLayout) else bar.layout()
-        if layout is None:
-            layout = QHBoxLayout(bar)
+        layout = self.steps_bar.layout()
         while layout.count():
             item = layout.takeAt(0)
             if item.widget():

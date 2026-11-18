@@ -16,7 +16,7 @@ import shutil
 import tempfile
 from types import SimpleNamespace
 
-from .script import ScriptMotion, ScriptPointer
+from .script import ScriptMotion, script_pointer_anchor, script_pointer_image
 
 
 def _snapshot(store):
@@ -147,7 +147,7 @@ class ScriptMovieExport:
                            for scene, per in self.builds.items()}}
 
     def finish(self, segments, python, env=None):
-        from .workers import WorkerProcess, run_blocking
+        from .workers import WorkerProcess
         if self.cancelled:
             raise RuntimeError("Movie export cancelled")
         generation = self.generation
@@ -163,7 +163,6 @@ class ScriptMovieExport:
             return {"path": str(self.destination), "duration": result["duration"], "frames": result["frames"]}
         finally:
             self.worker = None
-            run_blocking(self.discard)
 
     def cancel(self):
         self.cancelled = True
@@ -172,9 +171,6 @@ class ScriptMovieExport:
             self.voices.cancel()
         if self.worker:
             self.worker.cancel()
-        else:
-            from .workers import run_blocking
-            run_blocking(self.discard)
 
     def discard(self):
         shutil.rmtree(self.work, ignore_errors=True)
@@ -279,12 +275,14 @@ def audio_blocks(events, total_samples, block_size=1024):
 def compose(job, progress=lambda fraction, text="": None):
     """Worker entry point. No entire movie or audio track is held in memory."""
     import av
-    from PIL import ImageDraw
 
     output = Path(job["output"])
     fps = int(job["fps"])
     moves, speech = timeline(job)
     pointer = PointerTimeline(moves)
+    if any(kind == "move" for _, kind, _ in moves):
+        sprite, inset = script_pointer_image(job["slide"][3])
+        mask = sprite.getchannel("A")
     total = max((float(s["end"]) for s in job["segments"]), default=0)
     if total <= 0:
         raise ValueError("The engine returned no movie segments")
@@ -310,15 +308,13 @@ def compose(job, progress=lambda fraction, text="": None):
             pending = next(blocks, None)
             for frame in source.decode(video):
                 seconds = frame_index / fps
-                image = frame.to_image()
+                rendered = frame
                 point = pointer.at(seconds)
                 if point is not None:
-                    draw = ImageDraw.Draw(image)
-                    polygon = ScriptPointer.polygon(point, job["slide"])
-                    line_width = max(1, round(1.1 * max(14, job["slide"][3] * 0.045) / 20))
-                    draw.polygon(polygon, fill="white")
-                    draw.line(polygon + [polygon[0]], fill="black", width=line_width, joint="curve")
-                rendered = av.VideoFrame.from_image(image)
+                    image = frame.to_image()
+                    x, y = script_pointer_anchor(point, job["slide"])
+                    image.paste(sprite, (round(x) - inset, round(y) - inset), mask)
+                    rendered = av.VideoFrame.from_image(image)
                 rendered.pts, rendered.time_base = frame_index, Fraction(1, fps)
                 for packet in out_video.encode(rendered):
                     destination.mux(packet)
@@ -332,7 +328,7 @@ def compose(job, progress=lambda fraction, text="": None):
                     pending = next(blocks, None)
                 frame_index += 1
                 if frame_index % max(1, fps // 2) == 0:
-                    progress(min(0.99, seconds / total), f"Compositing {seconds:.1f}/{total:.1f} s")
+                    progress(min(0.99, seconds / total), "Adding the narration and pointer…")
             if not frame_index:
                 raise ValueError("The encoded movie has no decoded frames")
             for packet in out_video.encode(None):
@@ -349,7 +345,7 @@ def compose(job, progress=lambda fraction, text="": None):
                     destination.mux(packet)
         with output.open("rb") as file:
             os.fsync(file.fileno())
-        progress(1, "Narrated movie ready")
+        progress(1, "Adding the narration and pointer…")
         return {"path": str(output), "duration": frame_index / fps, "frames": frame_index}
     except BaseException:
         output.unlink(missing_ok=True)

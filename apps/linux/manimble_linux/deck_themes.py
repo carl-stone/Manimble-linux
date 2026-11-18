@@ -2,13 +2,18 @@
 from __future__ import annotations
 import ast
 from dataclasses import dataclass
-from pathlib import Path
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPixmap
-from PySide6.QtWidgets import QCheckBox, QComboBox, QDialog, QDialogButtonBox, QLabel, QVBoxLayout
-from .paths import engine_dir
-from .tasks import spawn
+
+from PySide6.QtCore import QRectF, Qt, QTimer
+from PySide6.QtGui import QFont, QImage, QPainter, QPainterPath, QPen
+from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QHBoxLayout, QLabel,
+                              QPushButton, QSizePolicy, QVBoxLayout, QWidget)
+
 from .formatbar import payload
+from .icon_art import THEME_SWATCH_SIZE, theme_swatch
+from .paths import engine_dir
+from .style import Theme, watch_appearance
+from .tasks import spawn
+from .widgets import field_label, hairline
 
 
 @dataclass(frozen=True)
@@ -35,82 +40,248 @@ class DeckTheme:
 
     @property
     def swatch(self):
-        pixmap = QPixmap(44, 25); pixmap.fill(QColor(self.background))
-        painter = QPainter(pixmap); painter.setPen(QColor(self.text)); painter.setFont(QFont("DejaVu Sans", 12)); painter.drawText(pixmap.rect(), Qt.AlignmentFlag.AlignCenter, "Aa"); painter.end()
-        return QIcon(pixmap)
+        return theme_swatch(self.background, self.text)
+
+
+class _ThemePreview(QWidget):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setFixedSize(480, 270)
+        self.image = QImage()
+        self.phase = 0
+        self.spinner = QTimer(self)
+        self.spinner.setInterval(65)
+        self.spinner.timeout.connect(self._spin)
+        self.status = field_label("", self)
+        self.status.setTextFormat(Qt.TextFormat.PlainText)
+        self.status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.status.setWordWrap(True)
+        self.status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Ignored)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 10, 20, 10)
+        layout.addWidget(self.status)
+        watch_appearance(self._repaint)
+
+    def _repaint(self):
+        self.update()
+
+    def _spin(self):
+        self.phase = (self.phase + 1) % 12
+        self.update()
+
+    def begin(self):
+        self.status.clear()
+        if not self.spinner.isActive():
+            self.spinner.start()
+        self.update()
+
+    def show_result(self, image, status=""):
+        self.spinner.stop()
+        self.image = image
+        self.status.setText(status)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setRenderHints(QPainter.RenderHint.Antialiasing | QPainter.RenderHint.SmoothPixmapTransform)
+        bounds = QRectF(self.rect())
+        spinning = self.spinner.isActive()
+        if not self.image.isNull():
+            clip = QPainterPath()
+            clip.addRoundedRect(bounds, 6, 6)
+            painter.save()
+            painter.setClipPath(clip)
+            painter.setOpacity(.35 if spinning else 1)
+            scale = min(bounds.width() / self.image.width(), bounds.height() / self.image.height())
+            rect = QRectF(0, 0, self.image.width() * scale, self.image.height() * scale)
+            rect.moveCenter(bounds.center())
+            painter.drawImage(rect, self.image)
+            painter.restore()
+        painter.setPen(QPen(Theme.separator(), 1))
+        painter.drawRoundedRect(bounds.adjusted(.5, .5, -.5, -.5), 6, 6)
+        if spinning:
+            painter.translate(bounds.center())
+            painter.rotate(self.phase * 30)
+            for index in range(12):
+                painter.setPen(QPen(Theme.ink(.15 + index / 17), 1.5,
+                                    Qt.PenStyle.SolidLine, Qt.PenCapStyle.RoundCap))
+                painter.drawLine(0, -8, 0, -5)
+                painter.rotate(30)
 
 
 class ThemeSheet(QDialog):
-    def __init__(self, theme, scene, engine, apply, parent=None):
+    def __init__(self, theme, scene, engine, apply, parent=None, *, undo_shortcut="Ctrl+Z"):
         super().__init__(parent)
         self.scene, self.engine, self.apply_fn = scene, engine, apply
-        self.generation = 0; self.previews = {}; self.crosses = {}
+        self.undo_shortcut = undo_shortcut
+        self.generation = 0
+        self.dismissed = False
+        self.previews = {}
+        self.crosses = {}
+        self.checking_crosses = set()
         self.themes = DeckTheme.all()
-        self.setWindowTitle("Theme"); self.resize(520, 560)
+        self.setWindowTitle("Theme")
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setFont(Theme.font(13))
+        self.resize(520, 560)
         layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 16)
+        layout.setSpacing(12)
+
+        heading = QLabel("Apply Theme", self)
+        heading.setFont(Theme.font(13, QFont.Weight.DemiBold))
+        layout.addWidget(heading)
+        theme_row = QHBoxLayout()
+        theme_row.setSpacing(10)
+        theme_row.addWidget(field_label("Theme", self))
         self.picker = QComboBox()
+        self.picker.setIconSize(THEME_SWATCH_SIZE)
         for item in self.themes: self.picker.addItem(item.swatch, item.name, item.id)
         self.picker.setCurrentIndex(max(0, self.picker.findData(theme.id)))
-        self.slide_only = QCheckBox("Apply to selected slide only")
-        self.flip = QCheckBox("Also swap whites and blacks in slides that do not use TEXT_COLOR")
+        self.picker.setAccessibleName("Theme")
+        theme_row.addWidget(self.picker)
+        theme_row.addStretch()
+        layout.addLayout(theme_row)
+
+        preview_column = QVBoxLayout()
+        preview_column.setSpacing(6)
+        caption = field_label(f"Preview of {scene}", self)
+        caption.setTextFormat(Qt.TextFormat.PlainText)
+        caption.setWordWrap(True)
+        preview_column.addWidget(caption)
+        self.preview = _ThemePreview(self)
+        preview_column.addWidget(self.preview)
+        layout.addLayout(preview_column)
+
+        self.slide_only = QCheckBox("Apply to selected slide only", self)
+        self.flip = QCheckBox("Also swap whites and blacks in the slides (for text that does not use TEXT_COLOR)", self)
+        self.flip.setFont(Theme.font(11))
         self.flip.setChecked(True)
-        self.image_view = QLabel(); self.image_view.setAlignment(Qt.AlignmentFlag.AlignCenter); self.image_view.setMinimumHeight(220)
-        self.status = QLabel(); self.status.setWordWrap(True); self.status.setStyleSheet("color:#FC6255")
-        self.detail = QLabel(); self.detail.setWordWrap(True)
-        for widget in (self.picker, self.slide_only, self.flip, self.image_view, self.status, self.detail): layout.addWidget(widget)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Cancel)
-        buttons.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(self.apply_pressed); buttons.rejected.connect(self.reject); layout.addWidget(buttons)
-        self.picker.currentIndexChanged.connect(self.changed); self.slide_only.toggled.connect(self.changed); self.flip.toggled.connect(self.load_preview)
-        self.finished.connect(lambda _: self.invalidate())
+        self.detail = field_label("", self)
+        self.detail.setWordWrap(True)
+        layout.addWidget(self.slide_only)
+        layout.addWidget(self.flip)
+        layout.addWidget(self.detail)
+        layout.addStretch()
+        layout.addWidget(hairline(self))
+
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        buttons.addStretch()
+        cancel_button = QPushButton("Cancel", self)
+        cancel_button.setAutoDefault(False)
+        cancel_button.clicked.connect(self.reject)
+        buttons.addWidget(cancel_button)
+        apply_button = QPushButton("Apply", self)
+        apply_button.setDefault(True)
+        apply_button.clicked.connect(self.apply_pressed)
+        buttons.addWidget(apply_button)
+        layout.addLayout(buttons)
+
+        self.picker.currentIndexChanged.connect(self.changed)
+        self.slide_only.toggled.connect(self.changed)
+        self.flip.toggled.connect(self.load_preview)
+        self.finished.connect(self.dismiss)
         self.changed()
+
     @property
-    def chosen(self): return self.themes[self.picker.currentIndex()]
+    def chosen(self):
+        return self.themes[self.picker.currentIndex()]
+
     @property
-    def flipping(self): return not self.slide_only.isChecked() and self.crosses.get(self.chosen.id, False) and self.flip.isChecked()
-    def invalidate(self): self.generation += 1
+    def flipping(self):
+        return not self.slide_only.isChecked() and self.crosses.get(self.chosen.id, False) and self.flip.isChecked()
+
+    def dismiss(self, _):
+        self.dismissed = True
+        self.generation += 1
+        self.preview.spinner.stop()
+
     def request(self, req):
         return self.engine.request("theme", req) if hasattr(self.engine, "request") else self.engine("theme", req)
+
     def changed(self, *_):
-        theme = self.chosen
-        self.detail.setText("This slide gets its own background and theme constants; shared helpers keep the deck's. Choosing the deck theme restores inheritance. Undo reverts it." if self.slide_only.isChecked() else "Changes the deck font, text, muted and accent constants and background, removing slide-specific themes. Every slide re-renders; Undo reverts it in one step.")
+        one = self.slide_only.isChecked()
+        theme_id = self.chosen.id
+        undo = self.undo_shortcut
+        if one:
+            self.detail.setText(
+                "This slide gets the theme's background, and its own code uses the theme's FONT, TEXT_COLOR, "
+                "MUTED_COLOR and ACCENT; helpers shared with other slides keep the deck's. Choosing the deck's own "
+                f"theme here takes the slide back to the deck's. Undo ({undo}) reverts it.")
+        else:
+            self.detail.setText(
+                "The deck's font, text colour and accent constants (FONT, TEXT_COLOR, MUTED_COLOR, ACCENT) and "
+                "its background are set to the theme's, and slides with a theme of their own take the deck's. "
+                f"Every slide is re-rendered. Undo ({undo}) reverts it in one step.")
+        self.flip.setVisible(not one and self.crosses.get(theme_id, False))
+        if theme_id in self.crosses:
+            self.load_preview()
+            return
+        self.generation += 1
+        self.preview.begin()
+        if theme_id in self.checking_crosses:
+            return
+        self.checking_crosses.add(theme_id)
+
+        def work():
+            if self.dismissed:
+                return
+            try:
+                info = yield self.request({"op": "get", "theme": theme_id})
+                crosses = bool(info.get("crosses"))
+            except Exception:
+                # Unknown crossing: try the preview without swapping, as the reference does.
+                crosses = False
+            self.checking_crosses.discard(theme_id)
+            self.crosses[theme_id] = crosses
+            if not self.dismissed and self.chosen.id == theme_id:
+                self.flip.setVisible(not self.slide_only.isChecked() and crosses)
+                self.load_preview()
+
+        spawn(work())
+
+    def load_preview(self, *_):
+        theme_id, one, flip = self.chosen.id, self.slide_only.isChecked(), self.flipping
         self.generation += 1
         generation = self.generation
-        self.flip.setVisible(not self.slide_only.isChecked() and self.crosses.get(theme.id, False))
-        if theme.id in self.crosses:
-            self.load_preview(); return
-        def work():
-            try:
-                info = yield self.request({"op": "get", "theme": theme.id, "current": self.scene})
-                if info.get("error"): raise RuntimeError(info["error"])
-                self.crosses[theme.id] = bool(info.get("crosses"))
-                if generation == self.generation:
-                    self.flip.setVisible(not self.slide_only.isChecked() and self.crosses[theme.id]); self.load_preview()
-            except Exception as exc:
-                if generation == self.generation: self.status.setText(str(exc))
-        spawn(work())
-    def load_preview(self, *_):
-        theme, one, flip = self.chosen, self.slide_only.isChecked(), self.flipping
-        self.generation += 1; generation = self.generation
-        key = (theme.id, one, flip)
-        self.status.setText("Rendering preview…")
+        key = (theme_id, one, flip)
         if key in self.previews:
-            self.show_preview(self.previews[key]); return
+            self.preview.show_result(self.previews[key])
+            return
+        self.preview.begin()
+
         def work():
+            if generation != self.generation:
+                return
+            image = QImage()
             try:
-                reply = yield self.request({"op": "preview", "theme": theme.id, "scene": self.scene, "slide_only": one, "flip": flip})
-                if not reply.get("png"): raise RuntimeError(reply.get("error", "The slide did not render"))
-                image = QPixmap(reply["png"])
-                if image.isNull(): raise RuntimeError("Could not read theme preview")
-                self.previews[key] = image
-                if generation == self.generation: self.show_preview(image)
+                reply = yield self.request({"op": "preview", "theme": theme_id, "scene": self.scene,
+                                            "slide_only": one, "flip": flip})
+                if self.dismissed:
+                    return
+                path = reply.get("png")
+                failure = reply.get("error")
+                if path and not image.load(path) and failure is None:
+                    failure = "Could not read theme preview"
             except Exception as exc:
-                if generation == self.generation: self.status.setText("No preview: " + str(exc))
+                failure = str(exc)
+            if not image.isNull():
+                self.previews[key] = image
+            if generation == self.generation:
+                if image.isNull():
+                    failure = failure if failure is not None else "the slide did not render"
+                    self.preview.show_result(image, f"No preview: {failure}")
+                else:
+                    self.preview.show_result(image)
+
         spawn(work())
-    def show_preview(self, image):
-        self.image_view.setPixmap(image.scaled(self.image_view.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)); self.status.clear()
+
     def apply_pressed(self):
         theme, one, flip = self.chosen, self.slide_only.isChecked(), self.flipping
-        self.accept(); self.apply_fn(theme, one, flip)
+        apply = self.apply_fn
+        self.accept()
+        apply(theme, one, flip)
 
 
 class DeckThemesMixin:
@@ -118,9 +289,44 @@ class DeckThemesMixin:
         theme_id = payload(item)
         themes = DeckTheme.all()
         theme = next((t for t in themes if t.id == theme_id), None)
-        if not theme or not self.scene_name: return
+        if not theme or not self.scene_name or getattr(self, "theme_sheet", None) is not None:
+            return
         target = self.scene_name
-        self.theme_sheet = ThemeSheet(theme, target, self.rpc, lambda t, one, flip: self.run_apply_theme(t, flip=flip, slide_only=one, scene=target), self.window)
-        self.theme_sheet.open()
+        sheet = ThemeSheet(theme, target, self.call,
+                           lambda t, one, flip: self.run_apply_theme(t, flip=flip, slide_only=one, scene=target),
+                           self.window, undo_shortcut=self.actions.shortcut_text("undo"))
+        self.theme_sheet = sheet
+        sheet.finished.connect(lambda _: setattr(self, "theme_sheet", None))
+        sheet.open()
+
     def run_apply_theme(self, theme, flip=False, slide_only=False, scene=None):
-        return self.tool_command("theme", {"theme": theme.id if isinstance(theme, DeckTheme) else theme, "flip": flip, "slide_only": slide_only, "current": scene or self.scene_name})
+        theme_id, name = (theme.id, theme.name) if isinstance(theme, DeckTheme) else (theme, theme)
+        req = {"theme": theme_id, "flip": flip, "slide_only": slide_only, "current": scene or self.scene_name}
+
+        def work():
+            self.busy_text = f"Applying the {name} theme…"
+            self.busy += 1
+            try:
+                result = yield self.call("theme", req)
+            except Exception as exc:
+                self.toast(str(exc), error=True)
+                return
+            finally:
+                self.busy -= 1
+                self.busy_text = "Rendering…"
+            if not result.get("ok"):
+                self.toast(result.get("error") or "theme change failed", error=True)
+                return result
+            self.last_changed = result.get("changed")
+            message = result.get("message") or ""
+            if message == "no change":
+                self.toast("The slide already has this theme" if slide_only else "The deck already has this theme")
+            else:
+                self.toast(f"Saved · {message}")
+            self.canvas.drop_textures()
+            yield from self.reload_state()
+            if self.scene_name:
+                yield from self.load_scene(self.scene_name, keep_stop=True)
+            return result
+
+        return self.submit(work)

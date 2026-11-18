@@ -13,6 +13,7 @@ import urllib.request
 from collections import Counter
 from dataclasses import dataclass
 from html.parser import HTMLParser
+from http.client import HTTPException
 from pathlib import Path
 
 from PIL import Image, ImageOps
@@ -219,13 +220,20 @@ def pasted_picture(picture, directory, prefix="pasted"):
     if kind == "file":
         data = Path(value).read_bytes()
     elif kind == "remote":
-        scheme = urllib.parse.urlsplit(value).scheme.lower()
-        if scheme not in ("http", "https", "data"):
-            raise ValueError("Only HTTP(S) and data images can be pasted")
-        with urllib.request.urlopen(value, timeout=60) as response:
-            if urllib.parse.urlsplit(response.url).scheme.lower() not in ("http", "https", "data"):
-                raise ValueError("Unsupported image redirect")
-            data = response.read()
+        url = urllib.parse.urlsplit(value)
+        try:
+            if url.scheme.lower() not in ("http", "https", "data"):
+                raise ValueError("Only HTTP(S) and data images can be pasted")
+            with urllib.request.urlopen(value, timeout=60) as response:
+                if urllib.parse.urlsplit(response.url).scheme.lower() not in ("http", "https", "data"):
+                    raise ValueError("Unsupported image redirect")
+                data = response.read()
+            picture_png = normalize_image(data)
+        except (OSError, ValueError, HTTPException) as exc:
+            # Match the paste failure caption without losing the actual transfer/decoder error.
+            detail = f"\n{exc}" if str(exc) else ""
+            raise RuntimeError(f"Could not get the pasted picture from {url.hostname or 'the web'}{detail}") from exc
+        return save_asset(picture_png, "png", directory, prefix)
     elif kind == "pdf":
         from PySide6.QtPdf import QPdfDocument
         document = QPdfDocument()
@@ -297,7 +305,7 @@ class ClipboardMixin:
                 request["seen"] = context.seen
             reply = yield self.call("copy", request)
             if not reply.get("ok") or not reply.get("items"):
-                self.toast(reply.get("error", "These elements are not on this build"), error=True)
+                self.toast(reply.get("error") or "Could not copy: these elements are not on this build", error=True)
                 return
             items = yield workers.run_blocking(_embed_items, reply["items"])
             copied = CopiedObjects(str(ws.original), context.scene, items)
@@ -312,9 +320,9 @@ class ClipboardMixin:
                 mime.setData("image/png", data)
                 mime.setImageData(QImage.fromData(data))
             (to or QApplication.clipboard()).setMimeData(mime)
-            why = next((item.get("why") for item in items if not item.get("code") and item.get("why")), None)
-            if why:
-                self.toast(f"Copied; part pastes as a picture: {why}")
+            unportable = next((item for item in items if item.get("code") is None), None)
+            if unportable and (why := unportable.get("why")) is not None:
+                self.toast(f"Copied; part of it pastes as a picture: {why}")
             if then and self.workspace is ws:
                 then()
             return copied
@@ -384,10 +392,12 @@ class ClipboardMixin:
             reply = yield from self._insert_pasted(context, items)
             if not reply.get("ok") and any(it["kind"] == "code" for it in items) and fallback:
                 # insert_many rolls back a failed render, so the image retry remains one undo unit.
-                self.toast(f"Pasting pictures instead: {reply.get('error', 'copied code did not run')}")
+                self.toast(f"Pasting pictures instead: {reply.get('error') or 'copied code did not run'}")
                 reply = yield from self._insert_pasted(context, fallback)
+            elif reply.get("ok"):
+                self.toast(f"Inserted {items[-1]['kind']}")
             if not reply.get("ok"):
-                self.toast(reply.get("error", "Paste failed"), error=True)
+                self.toast(reply.get("error") or "Paste failed", error=True)
             return reply
         return self.submit(work)
 
@@ -397,7 +407,7 @@ class ClipboardMixin:
         mime = from_.mimeData() if from_ is not None and hasattr(from_, "mimeData") else from_
         what = SlidePaste.read(mime)
         if what is None:
-            self.toast("Nothing on the clipboard can go on a slide: copy a picture or text", error=True)
+            self.toast("Nothing on the clipboard can go on a slide: copy a picture or some text", error=True)
             return
         if what.kind == "objects":
             return self.paste_objects(what.value)
@@ -417,12 +427,21 @@ class ClipboardMixin:
         def work():
             if what.kind == "pictures":
                 for item, picture in zip(items, what.value):
-                    item["file"] = yield workers.run_blocking(pasted_picture, picture, ws.work)
+                    remote = picture[0] == "remote"
+                    if remote:
+                        self.busy_pill.show("Downloading the pasted picture…", spinning=True, cancellable=False)
+                    try:
+                        item["file"] = yield workers.run_blocking(pasted_picture, picture, ws.work)
+                    finally:
+                        if remote:
+                            self.update_busy_pill()
             if self.workspace is not ws:
                 raise RuntimeError("The deck changed while preparing the paste")
             reply = yield from self._insert_pasted(context, items)
-            if not reply.get("ok"):
-                self.toast(reply.get("error", "Paste failed"), error=True)
+            if reply.get("ok"):
+                self.toast(f"Inserted {items[-1]['kind']}")
+            else:
+                self.toast(reply.get("error") or "Paste failed", error=True)
             return reply
         return self.submit(work)
 

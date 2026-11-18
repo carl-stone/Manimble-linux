@@ -7,20 +7,21 @@ from pathlib import Path
 import time
 from concurrent.futures import Future
 from PySide6.QtCore import QObject, Qt, QTimer, QSizeF
-from PySide6.QtGui import QAction
-from PySide6.QtWidgets import QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QSplitter, QScrollArea, QStackedWidget, QMessageBox, QTextEdit, QPlainTextEdit, QLineEdit
+from PySide6.QtGui import QPainter
+from PySide6.QtWidgets import QApplication, QFrame, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QMenu, QScrollArea, QStackedWidget, QMessageBox, QTextEdit, QPlainTextEdit, QLineEdit
 from .host import DeckHost, EditContext
 from .paths import AppPaths
 from .runtime import Runtime
 from .rpc import RpcClient, EngineError, EngineStopped
 from .tasks import SerialQueue, spawn, resolved, failed, when_done
 from .workers import run_blocking
-from .models import render_dir, frame_size, unit_px, stop_box, char_styles, frame_box, table_cells, table_cell_at
+from .models import Box, render_dir, frame_size, unit_px, stop_box, char_styles, frame_box, table_cells, table_cell_at
 from .actions import ActionRegistry
 from .source_pane import SourceMixin
 from .drawer import BottomDrawer, NotesMixin
 from .setup_ui import SetupMixin, dependency_report
 from . import prefs
+from .style import Theme, color_from_hex, watch_appearance
 
 from .project_controller import ProjectMixin
 from .darkmode import DarkModeMixin
@@ -45,6 +46,29 @@ from .biocartoon import BioCartoonMixin
 from .biocartoon_library import BCLibraryMixin
 from .latex_ui import LatexMixin
 from .menus import MenusMixin
+
+
+class _ShellSurface(QWidget):
+    def __init__(self, fill):
+        super().__init__()
+        self._fill = fill
+        watch_appearance(self.update)
+
+    def paintEvent(self, event):
+        with QPainter(self) as painter:
+            painter.fillRect(event.rect(), self._fill())
+
+
+class _BuildStrip(QScrollArea):
+    def wheelEvent(self, event):
+        bar = self.horizontalScrollBar()
+        if bar.maximum() > 0:
+            pixel, angle = event.pixelDelta(), event.angleDelta()
+            delta = (pixel.x() or pixel.y()) if not pixel.isNull() else (angle.x() or angle.y()) // 3
+            bar.setValue(bar.value() - delta)
+            event.accept()
+        else:
+            super().wheelEvent(event)
 
 
 class DeckWindow(QMainWindow):
@@ -79,10 +103,12 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
         self.stop_index = 0
         self._selection = None
         self._busy = 0
-        self.busy_text = 'Rendering…'
+        self._busy_text = 'Rendering…'
+        self._cancelling = False
         self.busy_progress = self.render_eta = None
-        self.verifying = False
+        self._verifying = False
         self.shown_dir = None
+        self._shown_scene = None
         self.pending_deck = None
         self.last_changed = self.last_build_move = None
         self.pending_moves = {}
@@ -101,6 +127,7 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
         self.renumbered = None
         self._queue = SerialQueue()
         self._connection_epoch = self._deck_epoch = self._scene_generation = 0
+        self._canvas_menu_generation = 0
         self._preview_generations = {}
         self._pending_identity_refs = []
         self._table_edit_target = None
@@ -180,16 +207,39 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
         if hasattr(self, 'busy_pill'):
             self.update_busy_pill()
 
+    @property
+    def verifying(self):
+        return self._verifying
+
+    @verifying.setter
+    def verifying(self, value):
+        if value != self._verifying:
+            self._verifying = value
+            self.update_busy_pill()
+
+    @property
+    def busy_text(self):
+        return self._busy_text
+
+    @busy_text.setter
+    def busy_text(self, text):
+        if text != self._busy_text:
+            self._busy_text = text
+            self.busy_progress = self.render_eta = None
+            if self.busy:
+                self.update_busy_pill()
+
     def _feature(self, name, *args, **kwargs):
         """Dispatch a feature hook without masking missing integration methods."""
         return getattr(self, name)(*args, **kwargs)
 
     def build_ui(self):
         from .canvas import CanvasView
-        from .widgets import Pill, SlideTable, GrabSplitView
+        from .widgets import Pill, SlideTable, GrabSplitView, StageHost
         self.canvas = CanvasView()
         self.canvas.show_grid = prefs.get_bool('showGrid')
         self.canvas.snap_enabled = prefs.get_bool('snapObjects', True)
+        self.canvas.pen_color = color_from_hex(prefs.get_str('penColor'), '#FF3B30')
         self.canvas.on_select = lambda oid: setattr(self, 'selection', oid)
         for callback, method in [('on_move', 'commit_move'), ('on_resize', 'commit_resize'),
                                  ('on_wrap', 'commit_wrap'), ('on_endpoints', 'commit_endpoints'),
@@ -210,20 +260,35 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
         self.busy_pill.on_cancel = self.cancel_render
         self.table = SlideTable()
         self._feature('init_navigator', self.table)
-        self.steps_bar = QWidget()
-        self.steps_bar.setLayout(QHBoxLayout())
-        self.steps_bar.layout().setContentsMargins(8, 4, 8, 4)
+        sidebar = _ShellSurface(Theme.sidebar_background)
+        sidebar.setMinimumWidth(190)
+        sidebar_layout = QVBoxLayout(sidebar)
+        sidebar_layout.setContentsMargins(0, 8, 0, 12)
+        sidebar_layout.addWidget(self.table)
+        self.steps_bar = _ShellSurface(Theme.canvas_bottom)
+        steps_layout = QHBoxLayout(self.steps_bar)
+        steps_layout.setContentsMargins(12, 4, 12, 8)
+        steps_layout.setSpacing(8)
+        self.steps_scroll = _BuildStrip()
+        self.steps_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.steps_scroll.setWidgetResizable(True)
+        self.steps_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.steps_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.steps_scroll.setFixedHeight(68)
+        self.steps_scroll.setWidget(self.steps_bar)
         stage = QWidget()
         stage_layout = QVBoxLayout(stage)
         stage_layout.setContentsMargins(0, 0, 0, 0)
+        stage_layout.setSpacing(0)
         from .rulers import RulerView
         self.stage_area = QWidget()
+        self.stage_area.setMinimumHeight(160)
         grid = QGridLayout(self.stage_area)
         grid.setContentsMargins(0, 0, 0, 0)
         grid.setSpacing(0)
         self.h_ruler = RulerView('horizontal', self.canvas)
         self.v_ruler = RulerView('vertical', self.canvas)
-        self.ruler_corner = QWidget()
+        self.ruler_corner = _ShellSurface(Theme.canvas_bottom)
         self.ruler_corner.setFixedSize(RulerView.thickness, RulerView.thickness)
         grid.addWidget(self.ruler_corner, 0, 0)
         grid.addWidget(self.h_ruler, 0, 1)
@@ -231,12 +296,10 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
         grid.addWidget(self.canvas, 1, 1)
         grid.setRowStretch(1, 1)
         grid.setColumnStretch(1, 1)
-        self.canvas.on_geometry_change = self.redraw_rulers
+        self.canvas.on_geometry_change = self.update_stage_geometry
         self.canvas.on_cursor_move = self.cursor_moved
-        stage_layout.addWidget(self.busy_pill)
         stage_layout.addWidget(self.stage_area, 1)
-        stage_layout.addWidget(self.steps_bar)
-        stage_layout.addWidget(self.toast_pill)
+        stage_layout.addWidget(self.steps_scroll)
         self.build_notes_pane()
         from .terminal import TerminalPanel
         self.terminal = TerminalPanel(controller=self)
@@ -244,37 +307,54 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
         self.engine_log = QPlainTextEdit()
         self.engine_log.setReadOnly(True)
         self.engine_log.setMaximumBlockCount(400)
-        self.drawer.add_page('log', self.engine_log, 'Engine Log')
+        self.engine_log.setFont(Theme.mono(12))
+        self.drawer.set_log_page(self.engine_log)
         self.drawer.on_hide = lambda: self.set_drawer_open(False)
+        self.drawer.on_show_terminal = self.show_terminal_page
+        self.drawer.on_new_terminal = self.new_terminal
         self.drawer.will_change_page = lambda _: self.commit_drawer()
         self.drawer.on_insert_image = lambda: self._feature('insert_notes_image')
         self.center_split = GrabSplitView(Qt.Orientation.Vertical, settings_key='manimble.drawer.sizes')
         self.center_split.collapses_last_pane = True
         self.center_split.addWidget(stage)
         self.center_split.addWidget(self.drawer)
-        self.center_split.setSizes([660, 150])
-        self.drawer.setVisible(prefs.get_bool('showNotes', True))
+        self.center_split.setStretchFactor(0, 1)
+        self._drawer_height = 140
+        self.center_split.setSizes([700, self._drawer_height])
+        saved_drawer = prefs.get_json('manimble.drawer.sizes', [])
+        valid_drawer = (isinstance(saved_drawer, list) and len(saved_drawer) == 2
+                        and all(isinstance(size, int) and size >= 0 for size in saved_drawer) and sum(saved_drawer))
+        if valid_drawer and saved_drawer[1]:
+            self._drawer_height = saved_drawer[1]
+        # A pane collapsed by dragging still has a grab handle to reopen it.
+        self.drawer.setVisible(prefs.get_bool('showNotes', True) or
+                               (valid_drawer and saved_drawer[1] == 0))
+        self.center_split.on_resize = self.drawer_split_moved
+        center = StageHost(self.center_split, self.busy_pill, self.toast_pill)
+        center.setMinimumWidth(500)
         self.inspector = QWidget()
         self.inspector.setLayout(QVBoxLayout())
         self.inspector_scroll = QScrollArea()
         self.inspector_scroll.setWidgetResizable(True)
+        self.inspector_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self.inspector_scroll.setWidget(self.inspector)
         self.inspector_host = QStackedWidget()
         self.inspector_host.addWidget(self.inspector_scroll)
-        right = QSplitter(Qt.Orientation.Vertical)
-        right.addWidget(self.inspector_host)
-        right.addWidget(self.make_source_pane())
-        right.setSizes([350, 450])
+        self.right_split = GrabSplitView(Qt.Orientation.Vertical)
+        self.right_split.setMinimumWidth(280)
+        self.right_split.addWidget(self.inspector_host)
+        self.right_split.addWidget(self.make_source_pane())
         self.main_split = GrabSplitView(settings_key='manimble.split.sizes')
         self.main_split.collapses_edge_panes = True
-        self.main_split.addWidget(self.table)
-        self.main_split.addWidget(self.center_split)
-        self.main_split.addWidget(right)
-        self.main_split.setSizes(prefs.get_json('manimble.split.sizes', [220, 920, 360]))
-        self.main_split.splitterMoved.connect(lambda *_: prefs.set('manimble.split.sizes', self.main_split.sizes()))
+        self.main_split.addWidget(sidebar)
+        self.main_split.addWidget(center)
+        self.main_split.addWidget(self.right_split)
+        self.main_split.setStretchFactor(1, 1)
+        self.main_split.setSizes([232, 890, 360])
         root = QWidget()
         layout = QVBoxLayout(root)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         self.format_bar = self._feature('make_format_bar')
         if self.format_bar is not None:
             layout.addWidget(self.format_bar)
@@ -290,10 +370,8 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
         self._feature('rebuild_inspector')
         from . import menus
         menus.register_actions(self, self.actions)
+        self.bind_home_actions()
         menus.build_menus(self, self.actions)
-        self._canvas_context_commands = []
-        for i, text in enumerate(('Show Credit…', 'Add to Local BioCartoon Library…', 'Upload to Online BioCartoon Library…')):
-            self.actions.add(f'canvas_bio_{i}', text, lambda i=i: self._canvas_context_commands[i][1]())
         toolbar = self._feature('make_toolbar')
         if toolbar is not None:
             self.window.addToolBar(toolbar)
@@ -301,7 +379,17 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
         self.busy_pill.hide()
 
     def show_window(self):
+        screen_size = self.window.screen().availableGeometry().size()
+        self.window.setMinimumSize(min(1000, screen_size.width()), min(600, screen_size.height()))
+        self.window.resize(self.window.size().boundedTo(screen_size))
         self.window.show()
+        if not prefs.has('manimble.split.sizes'):
+            span = self.main_split.width() - 2 * self.main_split.handleWidth()
+            self.main_split.setSizes([232, max(500, span - 592), 360])
+        self.right_split.setSizes([400, max(100, self.right_split.height() - 400 - self.right_split.handleWidth())])
+        if self.drawer.isVisible() and not prefs.has('manimble.drawer.sizes'):
+            span = self.center_split.height() - self.center_split.handleWidth()
+            self.center_split.setSizes([max(228, span - self._drawer_height), self._drawer_height])
         self.canvas.setFocus()
         screenshot = os.environ.get('MANIMBLE_SCREENSHOT')
         if screenshot:
@@ -309,6 +397,7 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
 
     def start(self):
         def begin():
+            self.busy_pill.show('Looking for a Python with manim…', spinning=True, cancellable=False)
             try:
                 if self.runtime is None:
                     self.runtime = Runtime.discover(self.paths, self.settings)
@@ -323,6 +412,8 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
             except Exception as exc:
                 self.show_setup(str(exc))
                 return False
+            finally:
+                self.update_busy_pill()
         return spawn(begin(), 'start').future
 
     def launch(self, python=None):
@@ -338,7 +429,10 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
         self._poll_timer.start()
         if self.pending_deck is not None:
             pending, self.pending_deck = self.pending_deck, None
-            self.open(pending)
+            if hasattr(self.app, 'open_deck_in'):
+                self.app.open_deck_in(self, pending)
+            else:
+                self.open(pending, confirmed=True)
 
     def call(self, cmd, args=None):
         if self.rpc is None:
@@ -390,14 +484,15 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
                 self._deck_epoch += 1
                 if old:
                     yield run_blocking(old.discard)
-                self.scene_name = self.scene = self.shown_dir = None
+                self.show_inspector_page(None)
+                self.scene_name = self.scene = None
+                self._clear_shown_scene()
                 self.selection = None
                 self.source_draft = self.source_edit_base = self.source_edit_scene_name = None
                 self.source_focused = False
                 self.pending_moves.clear()
                 self.pending_texts.clear()
                 self._preview_generations.clear()
-                self.canvas.stop = None
                 for box in (self.notes_box, self.build_notes_box):
                     box.image_base = workspace.work
                 feedback = self._feature('open_feedback', workspace)
@@ -407,6 +502,7 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
                 if inspect.isgenerator(script):
                     yield from script
                 yield from self.reopen_working_copy()
+                self.terminal.configure(workspace.work, original=workspace.original)
                 prefs.set('lastDeck', str(deck))
                 RecentDecks.note(deck, self.settings)
                 self.update_document_state()
@@ -446,6 +542,9 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
         if self.workspace:
             message += '\n\nUnsaved edits remain in this working copy. Restart keeps them, but engine undo history is lost. Unconfirmed edits are not replayed.'
         box = QMessageBox(QMessageBox.Icon.Critical, 'Manimble engine stopped', message, parent=self.window)
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        from .widgets import add_copy_button
+        add_copy_button(box)
         restart = box.addButton('Restart Engine', QMessageBox.ButtonRole.AcceptRole) if self.workspace else None
         box.addButton(QMessageBox.StandardButton.Close)
         box.setDefaultButton(QMessageBox.StandardButton.Close)
@@ -493,6 +592,7 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
             now = time.monotonic()
             if event.get('step') == 0:
                 self.render_eta = (now, event.get('estimate', 3))
+                self.busy_pill.bar.reset()
                 self.busy_progress = None
             elif self.render_eta and event.get('fraction', 0) >= .05:
                 start, total = self.render_eta
@@ -502,35 +602,20 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
         if kind == 'edit_failed':
             self.last_build_move = None
             self.verifying = False
-            self.toast(event.get('error', 'Edit failed') + ' (undone)', error=True)
+            self.toast((event.get('error') or 'edit failed') + ' (undone)', error=True)
             self._refresh_timer.start()
             return
         if kind == 'rendered':
             # Unversioned events invalidate state; their object ids never replace live state directly.
+            if event.get('name') == self.scene_name and self.render_eta is not None:
+                self.render_eta = None
+                self.busy_progress = 1
+                self.update_busy_pill()
             self._refresh_timer.start()
             return
-        handlers = {'present': 'handle_present_event', 'animation_preview': 'handle_animation_preview_event',
-                    'export_movie': 'finish_scripted_movie', 'import': 'handle_import_event', 'export': 'handle_export_event'}
-        handler = getattr(self, handlers.get(kind, ''), None)
-        if handler and handler(event):
+        if kind == 'export_movie' and self.handle_script_movie_event(event):
             return
-        phase = event.get('phase')
-        if phase in ('building', 'encoding'):
-            done, total = event.get('done', 0), event.get('total', 0)
-            self.busy_text = f"{kind.replace('_', ' ').title()} {done + 1}/{total}…"
-            self.busy_progress = done / total if total else None
-            self.busy_pill.show(self.busy_text, spinning=True, progress=self.busy_progress)
-        elif phase == 'done':
-            self.busy_pill.hide()
-            self.toast(f"Completed: {event.get('path', kind)}")
-            if kind == 'import' and event.get('deck'):
-                self.app.open_path(event['deck'])
-        elif phase == 'cancelled':
-            self.busy_pill.hide()
-            self.toast('Cancelled')
-        elif event.get('error') or phase == 'failed':
-            self.toast(event.get('error', f'{kind} failed'), error=True)
-        self._refresh_timer.start()
+        self.handle_project_event(event)
 
     def reload_state(self):
         if not self.workspace:
@@ -552,9 +637,9 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
                 if rows:
                     yield from self.select_scene(rows[min(index, len(rows) - 1)]['name'])
                 else:
-                    self.scene_name = self.scene = self.shown_dir = None
+                    self.scene_name = self.scene = None
+                    self._clear_shown_scene()
                     self.selection = None
-                    self.canvas.stop = None
                     self.render_source()
                 return
         row = next((r for r in rows if r['name'] == self.scene_name), None)
@@ -572,6 +657,8 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
                 yield from self._queue.drained()
                 if self.source_draft is not None:
                     self.toast('Fix the Python code before changing slides', error=True)
+                    self.select_row(next((i for i, row in enumerate(self.navigator_scenes)
+                                          if row['name'] == self.scene_name), -1))
                     self.source_view.setFocus()
                     return False
             self._feature('close_animation_preview')
@@ -625,6 +712,18 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
                                      for (scene_name, oid), value in self._preview_generations.items()
                                      if scene_name != name or remap(oid) is not None}
 
+    def _clear_shown_scene(self):
+        self.shown_dir = self._shown_scene = None
+        self.canvas.stop = None
+        self.canvas.scene_objects = {}
+        self.canvas.placeholders = []
+        self.canvas.optimistic = False
+        layer = getattr(self.canvas, 'feedback_layer', None)
+        if layer:
+            layer.scene = None
+            layer.rebuild()
+        self.canvas.viewport().update()
+
     def load_scene(self, name, keep_stop, keep_overrides=False):
         self._scene_generation += 1
         generation = self._scene_generation
@@ -638,20 +737,38 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
             if name != self.scene_name or generation != self._scene_generation:
                 return
             if scene.get('status') == 'cancelled':
+                if self._shown_scene != name:
+                    self._clear_shown_scene()
+                    self.scene = scene
+                    self.selection = None
+                    self.rebuild_steps()
+                    self.rebuild_inspector()
                 self.verifying = False
+                self.canvas.optimistic = False
                 self.toast('Cancelled')
                 return
             if scene.get('status') != 'ready' or not scene.get('stops'):
-                # Keep last-good canvas independently of failed source/scene diagnostics.
+                # Keep the last good frame only if this is the same slide.
+                if self._shown_scene != name:
+                    self._clear_shown_scene()
                 self.scene = scene
+                self.selection = None
                 self.verifying = False
+                self.canvas.optimistic = False
+                self.canvas.overrides.clear()
+                self.canvas.line_overrides.clear()
+                message = scene.get('error')
+                detail = ' '.join([line for line in (message or 'unknown error').split('\n') if line][-3:])
+                self.toast(f'Slide failed to render: {detail}', error=True)
                 self.render_source()
-                self.show_source_error(scene.get('error', 'Slide failed to render'))
-                self.toast(scene.get('error', 'Slide failed to render'), error=True)
+                self.show_source_error(message or 'scene not ready')
+                self.rebuild_steps()
+                self.rebuild_inspector()
                 return
             self.scene = scene
             self.verifying = bool(scene.get('optimistic'))
             self.shown_dir = str(Path(scene['stops'][0]['png']).parent)
+            self._shown_scene = name
             self.stop_index = min(self.stop_index, len(scene['stops']) - 1) if keep_stop else 0
             if self.selection is not None and str(self.selection) not in scene.get('objects', {}):
                 self.selection = None
@@ -690,7 +807,7 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
         if layer:
             layer.scene, layer.build = self.scene_name, self.stop_index
             layer.rebuild()
-        self.drawer.build_label.setText(f'build {self.stop_index + 1} of {len(stops)}' if len(stops) > 1 else '')
+        self.drawer.set_build_label(f'build {self.stop_index + 1} of {len(stops)}' if len(stops) > 1 else '')
         self._feature('sync_script_page')
         self.canvas.viewport().update()
 
@@ -729,16 +846,25 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
         self.canvas.setFocus()
         if self.source_draft is not None and not self.queued_work:
             self.submit(self.commit_source_draft)
-        yield from self._queue.drained()
-        if self.source_draft is not None:
-            raise EngineError('Fix the Python source before saving or closing. The draft remains editable.')
-        if self.workspace:
-            if self.feedback is not None:
-                yield self.feedback.flush()
-            yield self.call('settle')
-            self.verifying = False
-            if self.scene_name:
-                yield from self.load_scene(self.scene_name, True, True)
+        finishing = self.edits_in_flight
+        if finishing:
+            self.busy_text = 'Finishing edits…'
+            self.busy += 1
+        try:
+            yield from self._queue.drained()
+            if self.source_draft is not None:
+                raise EngineError('Fix the Python source before saving or closing. The draft remains editable.')
+            if self.workspace:
+                if self.feedback is not None:
+                    yield self.feedback.flush()
+                yield self.call('settle')
+                self.verifying = False
+                if self.scene_name:
+                    yield from self.load_scene(self.scene_name, True, True)
+        finally:
+            if finishing:
+                self.busy -= 1
+                self.busy_text = 'Rendering…'
 
     def run_edit(self, req):
         ctx = self.submit_context or self.edit_context
@@ -757,11 +883,19 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
         try:
             result = yield self.call('edit', args)
             if not result.get('ok'):
-                raise EngineError(result.get('error', 'Edit failed'))
+                raise EngineError(result.get('error') or 'edit failed')
             self.last_changed = result.get('changed')
-            self.last_build_move = (name, oid, args['stop']) if result.get('oneBuild') else None
-            self.toast('No change' if result.get('message') == 'no change' else 'Saved · ' + result.get('message', ''))
+            one_build = result.get('oneBuild')
+            self.last_build_move = (name, oid, args['stop']) if one_build and oid is not None else None
+            message = result.get('message') or ''
+            feedback = 'No change' if message == 'no change' else f'Saved · {message}'
+            if one_build:
+                feedback += f" · {self.actions.shortcut_text('spread_last_move')} applies it to every build"
+            if (siblings := result.get('siblings')) is not None:
+                feedback += f' ({siblings} similar objects share this line; all moved)'
+            self.toast(feedback)
         except Exception as exc:
+            self.last_changed = self.last_build_move = None
             self.toast(str(exc), error=True)
             result = {'ok': False, 'error': str(exc)}
         finally:
@@ -773,7 +907,8 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
                 if now is not None:
                     self.settle_preview(name, oid, now, result.get('ok', False), before)
         yield from self.reload_state()
-        if result.get('pageNumber'):
+        if (result.get('pageNumber') and oid is not None and f'{name}:{oid}' not in self.pending_moves
+                and not self.canvas.is_dragging(oid)):
             self._feature('offer_page_number_spread', name)
         return result
 
@@ -918,12 +1053,12 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
         elif obj.get('kind') == 'tex':
             self._feature('open_latex', oid)
         elif obj.get('kind') == 'text':
-            if not obj.get('textOk'):
-                self.toast(obj.get('textNote', 'This text is generated by code'), error=True)
-            else:
-                self.begin_inline_text(oid, obj, at)
+            if obj.get('textOk') and not self.begin_inline_text(oid, obj, at) and self.text_field is not None:
+                self.text_field.setFocus()
+                self.text_field.selectAll()
         elif obj.get('kind') == 'table':
-            self.begin_cell_edit(oid, obj, at)
+            if not self.begin_cell_edit(oid, obj, at):
+                self.focus_first_table_cell()
 
     def begin_inline_text(self, oid, obj, at=None):
         name, seen = self.scene_name, self.edit_context.seen
@@ -931,6 +1066,7 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
         fmt = obj.get('format') or {}
         def done(value, release):
             if value is None:
+                self._mirror_text(current)
                 release()
             else:
                 self.commit_text(oid, value, self.shared_choice, self.canvas.committed_styles, name, seen, release)
@@ -955,7 +1091,8 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
                 cell = table_cell_at(self.canvas.stop, oid, point.x(), point.y())
         if cell is None:
             return False
-        rows = self.table_draft() if self.table_grid is not None else self.table_rows(obj.get('value', ''))
+        grid = self.table_grid
+        rows = self.table_draft() if grid is not None else self.table_rows(obj.get('value', ''))
         r, c = cell[:2]
         if r >= len(rows) or c >= len(rows[r]):
             return False
@@ -963,9 +1100,8 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
         self._table_edit_target = (ctx, oid, r, c)
         current = rows[r][c]
         def mirror(value):
-            grid = self.table_grid
-            if grid is not None and grid.item(r, c) is not None:
-                grid.item(r, c).setText(value)
+            if self.table_grid is grid and grid is not None and (field := grid.cell(r, c)) is not None:
+                field.setText(value)
         def done(value, release):
             if value is None:
                 mirror(current)
@@ -990,7 +1126,7 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
         ctx, oid, row, col = target
         def advance():
             yield from self._queue.drained()
-            if self.scene_name != ctx.scene:
+            if self.scene_name != ctx.scene or self.stop_index != ctx.stop:
                 return
             if ctx.seen != self.edit_context.seen:
                 mapped = yield self.call('resolve_oids', {'scene': ctx.scene, 'from': ctx.seen,
@@ -1015,6 +1151,9 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
         if not name:
             return
         self.selection = None
+        box = Box.of(placeholder.get('rect') or placeholder.get('box'))
+        on_light = box is not None and self.canvas.backdrop_is_light(box)
+        color = (self.scene or {}).get('textColor') or ('#000000' if on_light else '#FFFFFF')
         def done(value, release):
             text = '\n'.join(line for line in (value or '').splitlines() if line.strip(' •\t'))
             if not text:
@@ -1022,32 +1161,41 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
                 return
             def commit():
                 try:
-                    result = yield self.call('placeholder', {'scene': name, 'line': placeholder['line'], 'text': text})
+                    args = {'scene': name, 'line': placeholder['line'], 'text': text}
+                    if on_light:
+                        args['color'] = '#000000'
+                    result = yield self.call('placeholder', args)
                     if not result.get('ok'):
-                        raise EngineError(result.get('error', 'Could not add text'))
+                        self.toast(result.get('error') or 'could not add the text', error=True)
+                        return
+                    self.last_changed = result.get('changed')
                     yield from self.load_scene(name, True, True)
                     yield from self.reload_state()
+                    self.toast(f"Saved · {result.get('message') or ''}")
                 finally:
                     release()
             self.submit(commit)
         self.canvas.begin_text_edit(-1, text='• ' if placeholder.get('role') == 'body' else '',
             family=(self.scene or {}).get('font'), bold=False, italic=False,
-            color=(self.scene or {}).get('textColor', '#FFFFFF'), at=None, placeholder=placeholder, changed=lambda _: None, done=done)
+            color=color, at=None, placeholder=placeholder, changed=lambda _: None, done=done)
 
     def remove_placeholder(self, line):
         name = self.scene_name
         def remove():
             result = yield self.call('placeholder', {'scene': name, 'line': line, 'op': 'remove'})
             if not result.get('ok'):
-                raise EngineError(result.get('error', 'Could not remove box'))
+                self.toast(result.get('error') or 'could not remove the box', error=True)
+                return
+            self.last_changed = result.get('changed')
             yield from self.load_scene(name, True, True)
             yield from self.reload_state()
+            self.toast(f"Saved · {result.get('message') or ''}")
         self.submit(remove)
 
     def refresh_inspector_text(self):
         if self.text_field is not None and not self.text_field.hasFocus() and self.canvas.editing_text is None and self.obj_info:
             if f'{self.scene_name}:{self.selection}' not in self.pending_texts:
-                self.text_field.set_text(self.obj_info.get('value', ''))
+                self.text_field.set_text(self.obj_info.get('value', ''), char_styles(self.obj_info))
 
     def undo(self):
         return self.do_undo(False)
@@ -1124,41 +1272,90 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
         return run_blocking(save)
 
     def show_inspector_page(self, widget):
-        if widget is None:
-            self.inspector_host.setCurrentWidget(self.inspector_scroll)
-        else:
+        if widget is not None:
+            self._set_side_pane(2, 360, True)
             if self.inspector_host.indexOf(widget) < 0:
                 self.inspector_host.addWidget(widget)
-            self.inspector_host.setCurrentWidget(widget)
+        target = self.inspector_scroll if widget is None else widget
+        if self.inspector_host.currentWidget() is not target:
+            self.inspector_host.setCurrentWidget(target)
+            self.sync_feedback_button()
+            self.sync_script_button()
+
+    def _set_side_pane(self, index, default_width, on=None):
+        widget = self.main_split.widget(index)
+        opened = widget.isVisible() and self.main_split.sizes()[index] > 0
+        if on is None:
+            on = not opened
+        widget.setVisible(on)
+        if on:
+            sizes = self.main_split.sizes()
+            if sizes[index] == 0:
+                sizes[index] = default_width
+                self.main_split.setSizes(sizes)
 
     def toggle_navigator(self):
-        widget = self.main_split.widget(0)
-        widget.setVisible(not widget.isVisible())
+        self._set_side_pane(0, 232)
 
     def toggle_inspector(self):
-        widget = self.main_split.widget(2)
-        widget.setVisible(not widget.isVisible())
+        self._set_side_pane(2, 360)
+
+    def update_stage_geometry(self):
+        self.redraw_rulers()
+        self.sync_zoom_popup()
 
     def cursor_moved(self, point):
         self.h_ruler.cursor = self.v_ruler.cursor = point
 
-    def canvas_menu(self):
+    def canvas_menu(self, position):
         if not self.scene_name or self.player:
-            return None
-        if not self.obj_info:
-            return self.actions.context_menu(['format_background'])
-        items = []
-        if self.obj_info.get('kind') in ('text', 'tex'):
-            action = self.actions.action('hyperlink_pressed')
-            link = (self.obj_info.get('format') or {}).get('link')
-            action.setText('Edit Hyperlink…' if link else 'Add Hyperlink…')
-            action.setToolTip(link or '')
-            items.append('hyperlink_pressed')
-        self._canvas_context_commands = self._feature('bio_cartoon_menu_items') or []
-        items.extend(f'canvas_bio_{i}' for i in range(len(self._canvas_context_commands)))
-        items.extend(['bring_to_front', 'bring_forward', 'send_backward', 'send_to_back',
-                      'group_objects', 'ungroup_objects'])
-        return self.actions.context_menu(items)
+            return
+        self._canvas_menu_generation += 1
+        generation = self._canvas_menu_generation
+        obj = self.obj_info
+        target = self._deck_epoch, self.scene_name, self.selection
+
+        def show(items=()):
+            if (generation != self._canvas_menu_generation or self.player or self._closing
+                    or target != (self._deck_epoch, self.scene_name, self.selection)):
+                return
+            self.actions.refresh()
+            menu = QMenu(self.canvas)
+            menu.setToolTipsVisible(True)
+            menu.aboutToHide.connect(menu.deleteLater)
+            if obj is None:
+                menu.addAction(self.actions.present('format_background', menu, text='Format Background…'))
+            else:
+                if obj.get('kind') in ('text', 'tex'):
+                    url = (obj.get('format') or {}).get('link')
+                    menu.addAction(self.actions.present('hyperlink_pressed', menu, text=(
+                        'Edit Hyperlink…' if url is not None else 'Add Hyperlink…'), tip=url or ''))
+                for label, callback, tip in items:
+                    action = menu.addAction(label)
+                    action.setEnabled(callback is not None)
+                    if tip:
+                        action.setToolTip(tip)
+                    if callback is not None:
+                        action.triggered.connect(lambda checked=False, run=callback: run())
+                if menu.actions():
+                    menu.addSeparator()
+                if len(self.canvas.selected_ids) > 1:
+                    menu.addAction(self.actions.present('group_objects', menu))
+                if self.selection_is_grouped:
+                    menu.addAction(self.actions.present('ungroup_objects', menu))
+                for command in ('bring_to_front', 'bring_forward', 'send_backward', 'send_to_back'):
+                    menu.addAction(self.actions.present(command, menu))
+            menu.popup(position)
+
+        path = (obj.get('imagePath') or obj.get('image_path')) if obj and obj.get('kind') == 'image' else None
+        if path:
+            def picture_menu():
+                items = yield from self.bio_cartoon_menu_items(path)
+                if self.obj_info is obj:
+                    show(items)
+            spawn(picture_menu(), 'picture context menu')
+        else:
+            show()
 
     def prev_slide(self):
         self.move_slide(-1)
@@ -1190,10 +1387,17 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
         self.terminal.set_start_in_work_copy(not prefs.get_bool('terminalInWorkCopy', True))
 
     def toast(self, text, error=False):
-        if not error and not self.show_tips and not str(text).lower().startswith('cancelled'):
+        text = str(text)
+        cancelled = text.lower().startswith('cancelled')
+        if not error and not self.show_tips and not cancelled:
             return
-        self.toast_pill.show(str(text), tint='#dd5050' if error else None)
-        self.window.statusBar().showMessage(str(text), 12000 if error else 4500)
+        if cancelled:
+            self.toast_pill.show('Cancelled · the edit was undone' if text.endswith('(undone)') else 'Cancelled',
+                                 symbol='xmark.circle.fill', tint=Theme.secondary_ink)
+        elif error:
+            self.toast_pill.show(text, symbol='exclamationmark.triangle.fill', tint=Theme.warning_ink)
+        else:
+            self.toast_pill.show(text)
         self.schedule_toast_hide(8 if error else 2.6)
 
     def schedule_toast_hide(self, delay, *, generation=None):
@@ -1210,23 +1414,40 @@ class MainController(QObject, DeckHost, SourceMixin, NotesMixin, SetupMixin, Pro
         QTimer.singleShot(round(delay * 1000), hide)
 
     def alert(self, title, text):
-        box = QMessageBox(QMessageBox.Icon.Warning, title, text, QMessageBox.StandardButton.Ok, self.window)
+        from .widgets import add_copy_button
+        box = QMessageBox(QMessageBox.Icon.Warning, title, title, QMessageBox.StandardButton.Ok, self.window)
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setInformativeText(text)
         box.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        add_copy_button(box)
         box.open()
         self._alert = box
 
     def update_busy_pill(self):
         if self.busy or self.verifying:
             remaining = max(0, self.render_eta[1] - (time.monotonic() - self.render_eta[0])) if self.render_eta else None
-            self.busy_pill.show(self.busy_text, spinning=True, progress=self.busy_progress,
-                                remaining=remaining, cancellable=self.busy > 0)
+            text = 'Cancelling…' if self._cancelling else self.busy_text
+            self.busy_pill.show(text, spinning=True, progress=self.busy_progress,
+                                remaining=remaining, cancellable=self.busy > 0 and not self._cancelling)
         else:
             self.busy_pill.hide()
             self.busy_progress = self.render_eta = None
+            if self._cancelling:
+                self._busy_text = 'Rendering…'
+            self._cancelling = False
 
     def cancel_render(self):
+        if self.cancel_script_movie():
+            return
+        if not self.rpc or not self.rpc.running or self._cancelling:
+            return
         self.cancel_plot()
-        self.busy_text = 'Cancelling…'
+        self.busy_progress = self.render_eta = None
+        if self.busy or self.verifying:
+            self._cancelling = True
+            self.update_busy_pill()
+        else:
+            self.busy_pill.show('Cancelling…', spinning=True)
         self._watch(self.call('cancel'))
 
     def stop_feature_workers(self):

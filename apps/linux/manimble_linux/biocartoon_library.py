@@ -21,16 +21,19 @@ from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 from PIL import Image, ImageOps
-from PySide6.QtCore import QByteArray, QBuffer, QIODevice, Qt
-from PySide6.QtGui import QImage, QPainter, QPixmap
+from PySide6.QtCore import QByteArray, QBuffer, QIODevice, QPoint, QRect, QRectF, QSize, Qt
+from PySide6.QtGui import QColor, QImage, QPainter
 from PySide6.QtSvg import QSvgRenderer
 from PySide6.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLineEdit, QPlainTextEdit,
-    QLabel, QComboBox, QCheckBox, QDialogButtonBox, QMessageBox, QScrollArea, QWidget,
+    QDialog, QVBoxLayout, QHBoxLayout, QLineEdit, QPlainTextEdit, QPushButton, QCompleter,
+    QComboBox, QCheckBox, QMessageBox, QProgressBar, QScrollArea, QFrame, QWidget,
 )
 
 from . import prefs
-from .biocartoon import BioCartoonCLI, BCIcon, atomic_bytes, biocartoon_data, HTTP_HEADERS
+from .biocartoon import (
+    BioCartoonCLI, BCIcon, HTTP_HEADERS, _file_size, _label, _set_ink, atomic_bytes, biocartoon_data,
+)
+from .style import Theme, is_dark, watch_appearance
 from .tasks import spawn
 from .workers import run_blocking
 
@@ -47,7 +50,8 @@ class BCLibrary:
     max_image_side = 4096
     max_per_hour = 10
     licenses = [("CC0-1.0", "CC0 (no credit needed)"), ("CC-BY-4.0", "CC BY 4.0 (users must credit you)")]
-    cc_by_needs_no_ai = "CC BY requires confirmation that no generative AI was used."
+    cc_by_needs_no_ai = ('This license is not compatible with generative AI content. '
+                        'Check "No generative AI was used" above (if correct) to select this license.')
     already_submitted = "Icon has already been submitted"
 
     @dataclass
@@ -57,6 +61,8 @@ class BCLibrary:
         size: tuple[int, int]
         bytes: int
         reduced_from: tuple[int, int] | None = None
+        source_size: tuple[int, int] | None = None
+        fingerprint: str | None = None
 
     @dataclass
     class Row:
@@ -104,8 +110,9 @@ class BCLibrary:
             image = original.resize(tuple(max(1, round(x * scale)) for x in original.size), Image.Resampling.LANCZOS)
 
     @classmethod
-    def read(cls, path):
+    def read(cls, path, *, fingerprint=False):
         data = Path(path).read_bytes()
+        identity = cls._fingerprint_chunks((data,)) if fingerprint else None
         if cls.is_svg(data):
             text = data.decode("utf-8")
             renderer = QSvgRenderer(QByteArray(data))
@@ -127,21 +134,26 @@ class BCLibrary:
                 raise ValueError("The SVG preview cannot be saved")
             with Image.open(BytesIO(bytes(buffer.data()))) as src:
                 fit, png = cls.fit_png(src.convert("RGBA"))
-            return cls.Picture(text, png, fit.size, len(data))
+            return cls.Picture(text, png, fit.size, len(data), source_size=(size.width(), size.height()),
+                               fingerprint=identity)
         with Image.open(BytesIO(data)) as src:
             image = ImageOps.exif_transpose(src).convert("RGBA")
         own = image.size
         image.thumbnail((cls.max_image_side, cls.max_image_side), Image.Resampling.LANCZOS)
         fit, png = cls.fit_png(image)
-        return cls.Picture(None, png, fit.size, len(png), own if own != fit.size else None)
+        return cls.Picture(None, png, fit.size, len(png), own if own != fit.size else None, fingerprint=identity)
+
+    @classmethod
+    def fingerprint(cls, path):
+        with open(path, "rb") as stream:
+            return cls._fingerprint_chunks(iter(lambda: stream.read(65536), b""))
 
     @staticmethod
-    def fingerprint(path):
+    def _fingerprint_chunks(chunks):
         h = 0xcbf29ce484222325
-        with open(path, "rb") as stream:
-            while chunk := stream.read(65536):
-                for byte in chunk:
-                    h = ((h ^ byte) * 0x100000001b3) & 0xffffffffffffffff
+        for chunk in chunks:
+            for byte in chunk:
+                h = ((h ^ byte) * 0x100000001b3) & 0xffffffffffffffff
         return f"file:{h:016x}"
 
     @staticmethod
@@ -196,7 +208,7 @@ class BCLibrary:
         cls.validate(pic, row, share=False)
         catalog = Path(catalog)
         if not catalog.is_file():
-            raise ValueError("The BioCartoon catalog has not been downloaded; open BioCartoon Icons first")
+            raise ValueError("The BioCartoon catalog is not downloaded yet: open Insert ▸ BioCartoon Icons… first")
         directory = catalog.parent.parent / "user_generated"
         slug = cls.slug(row.title)
         key = id or slug
@@ -255,7 +267,10 @@ class BCLibrary:
 
     @classmethod
     def was_submitted(cls, path, state_file=None):
-        fingerprint = cls.fingerprint(path)
+        return cls.has_submission(cls.fingerprint(path), state_file)
+
+    @classmethod
+    def has_submission(cls, fingerprint, state_file=None):
         with cls._submission_db(state_file) as db:
             return db.execute("SELECT 1 FROM submitted WHERE fingerprint=?", (fingerprint,)).fetchone() is not None
 
@@ -357,127 +372,267 @@ class BCLibrary:
                        ("user/" + submitted_id, "user/" + submitted_id + ".png", local_id))
 
 
+class _PictureWell(QWidget):
+    def __init__(self, picture):
+        super().__init__()
+        self.image = QImage.fromData(picture.png)
+        self.setMinimumSize(140, 140)
+        self.setAccessibleName("Picture preview")
+        watch_appearance(self.update_appearance)
+
+    def update_appearance(self):
+        self.update()
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        tone = .16 if is_dark() else .96
+        p.setBrush(QColor.fromRgbF(tone, tone, tone))
+        p.setPen(Theme.separator())
+        p.drawRoundedRect(QRectF(self.rect()).adjusted(.5, .5, -.5, -.5), 8, 8)
+        if not self.image.isNull():
+            size = self.image.size()
+            size.scale(self.size() - QSize(32, 32), Qt.AspectRatioMode.KeepAspectRatio)
+            box = QRect(QPoint(), size)
+            box.moveCenter(self.rect().center())
+            p.drawImage(box, self.image)
+
+
 class BCLibraryDialog(QDialog):
     def __init__(self, file, picture, share, categories=(), within=None):
         super().__init__(within)
-        self.file, self.pic, self.share = str(file), picture, share
+        self.pic, self.share = picture, share
         self.on_done = None
+        self.working = False
         self.setWindowTitle("Add to BioCartoon library" if share else "Add to your library")
-        self.resize(860, 700)
-        layout = QVBoxLayout(self)
-        horizontal = QHBoxLayout()
-        preview = QLabel()
-        preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        preview.setMinimumSize(250, 250)
-        image = QImage.fromData(picture.png)
-        preview.setPixmap(QPixmap.fromImage(image).scaled(420, 540, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation))
-        horizontal.addWidget(preview, 1)
+        self.setFont(Theme.font(13))
+        bounds = self.screen().availableGeometry()
+        parent_size = within.size() if within else QSize(1000, 835)
+        self.resize(min(max(round(parent_size.width() * .86), 760), 1400, bounds.width() - 20),
+                    min(max(round(parent_size.height() * .84), 560), 1000, bounds.height() - 20))
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(16, 16, 12, 16)
+        layout.setSpacing(16)
+        layout.addWidget(_PictureWell(picture), 1)
+
+        right = QVBoxLayout()
+        right.setSpacing(10)
         scroll = QScrollArea()
+        scroll.setFixedWidth(340)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setWidgetResizable(True)
-        form_widget = QWidget()
-        form = QFormLayout(form_widget)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.form_widget = QWidget()
+        form = QVBoxLayout(self.form_widget)
+        form.setContentsMargins(0, 0, 0, 8)
+        form.setSpacing(4)
+        self._secondary = []
+        self._errors = []
+
+        def field(label, control):
+            if form.count():
+                form.addSpacing(6)
+            caption = _label(label, 13)
+            caption.setBuddy(control)
+            form.addWidget(caption)
+            control.setFixedWidth(320)
+            form.addWidget(control)
+
+        def notice(text, error=False):
+            label = _label(text, 11)
+            label.setWordWrap(True)
+            label.setFixedWidth(320)
+            (self._errors if error else self._secondary).append(label)
+            form.addWidget(label)
+
+        def confirm(box, text):
+            row = QHBoxLayout()
+            row.setSpacing(4)
+            box.setAccessibleName(text)
+            label = _label(text, 11)
+            label.setWordWrap(True)
+            label.setFixedWidth(298)
+            label.setBuddy(box)
+            row.addWidget(box, 0, Qt.AlignmentFlag.AlignTop)
+            row.addWidget(label)
+            row.addStretch()
+            form.addLayout(row)
+
         self.name_field = QLineEdit(Path(file).stem.replace("_", " ").replace("-", " "))
-        self.name_field.setMaxLength(80)
         self.category = QComboBox()
         self.category.setEditable(True)
-        self.category.addItem("")
-        self.category.addItems([c.name for c in categories])
-        self.category.lineEdit().setMaxLength(60)
+        self.category.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
+        self.category.setMaxVisibleItems(14)
+        self.category.lineEdit().setPlaceholderText("pick one or type your own")
+        self.category.setToolTip("Current categories")
+        completions = []
+        for top in (c for c in categories if "." not in c.slug):
+            self.category.addItem(top.name, top.name)
+            completions.append(top.name)
+            for child in (c for c in categories if c.slug.startswith(top.slug + ".")):
+                self.category.addItem("    " + child.name, child.name)
+                completions.append(child.name)
+        self.category.setCurrentIndex(-1)
+        completer = QCompleter(completions, self.category)
+        completer.setCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        completer.setCompletionMode(QCompleter.CompletionMode.InlineCompletion)
+        self.category.setCompleter(completer)
+        self.category.activated.connect(lambda i: self.category.setEditText(self.category.itemData(i)))
         self.description_field = QPlainTextEdit()
-        self.description_field.setMaximumHeight(100)
+        self.description_field.setFixedHeight(56)
+        self.description_field.setPlaceholderText("optional")
+        self.description_field.setTabChangesFocus(True)
         self.tags_field = QLineEdit()
-        self.tags_field.setPlaceholderText("Commas between; up to 20 tags")
-        self.no_ai = QCheckBox("No generative AI was used to create this asset")
+        self.tags_field.setPlaceholderText("optional, commas between")
+        self.tags_field.setToolTip("Words to find it by in search, up to 20 (each up to 40 characters)")
+        self.no_ai = QCheckBox("No generative AI was used to create this asset.")
         self.license = QComboBox()
         for key, label in BCLibrary.licenses:
             self.license.addItem(label, key)
+        self.license.view().setMouseTracking(True)
         self.credit_field = QLineEdit(prefs.get_str("biocartoonCredit"))
-        self.credit_field.setMaxLength(60)
+        self.credit_field.setPlaceholderText("your name")
         self.email_field = QLineEdit(prefs.get_str("biocartoonEmail"))
+        self.email_field.setPlaceholderText("optional, never published")
+        self.email_field.setToolTip("Only the BioCartoon team sees it, in case they have a question about your submission")
         self.official = QCheckBox("Submit as official BioCartoon asset")
-        for label, field in [("Name", self.name_field), ("Category", self.category), ("Description", self.description_field), ("Tags", self.tags_field)]:
-            form.addRow(label, field)
+        for label, control in (("Name", self.name_field), ("Category", self.category),
+                               ("Description", self.description_field), ("Tags", self.tags_field)):
+            field(label, control)
         if share:
-            form.addRow(self.no_ai)
-            for label, field in [("License", self.license), ("Credit as", self.credit_field), ("Email (private)", self.email_field)]:
-                form.addRow(label, field)
-            form.addRow(self.official)
-            disclosure = QLabel("Reviewed before publication. The asset, name, credit, description, categories, tags, AI disclosure and chosen license become public; email goes only to the BioCartoon team. You retain copyright. Reviewers may redirect official submissions to User-generated.")
-            disclosure.setWordWrap(True)
-            form.addRow(disclosure)
+            form.addWidget(self.no_ai)
+            field("License", self.license)
+            field("Credit as", self.credit_field)
+            field("Email", self.email_field)
+            form.addWidget(self.official)
+            form.addSpacing(6)
+            notice("List under the official BioCartoon library rather than the User-Generated library. You are still listed as the author. Reviewers reserve the right to redirect your submission to the User-Generated library.")
+            notice("It is reviewed before anyone else sees it, and kept in Your library meanwhile. Once approved, the name, credit and details above are public.")
+            notice("You keep the copyright. BioCartoon and its users only get the license you chose.")
+            notice('To submit anonymously, choose the CC0 license and leave "Credit as" blank.')
         else:
-            form.addRow(QLabel("Saved on this computer only."))
-        form.addRow(QLabel(f"Size: {picture.size[0]} × {picture.size[1]} px; {picture.bytes:,} bytes"))
-        form.addRow(QLabel("SVG (vector)" if picture.svg else "PNG (raster)"))
-        self.png_ok = QCheckBox("I confirm adding a PNG; SVG is recommended")
-        self.reduced_ok = QCheckBox(f"I confirm the reduced size (from {picture.reduced_from})")
-        if not picture.svg:
-            form.addRow(self.png_ok)
+            notice("Saved on this computer only.")
+            for control in (self.no_ai, self.license, self.credit_field, self.email_field, self.official):
+                control.setParent(self)
+                control.hide()
+
+        w, h = picture.source_size or picture.size
+        form.addWidget(_label(f"Size: {w} × {h} px ({_file_size(picture.bytes)})", 13))
+        if picture.bytes > self.limit:
+            notice(f"Icons can be up to {_file_size(self.limit)}: simplify the drawing.", error=True)
+        form.addWidget(_label("File type: SVG (vector)" if picture.svg is not None else "File type: PNG (raster)", 13))
+        self.png_ok, self.reduced_ok = QCheckBox(self), QCheckBox(self)
+        if picture.svg is None:
+            confirm(self.png_ok, "This file is a PNG (raster). SVG (vector) is recommended for upload. Please check here to confirm this choice.")
+        else:
+            self.png_ok.hide()
         if picture.reduced_from:
-            form.addRow(self.reduced_ok)
-        self.problem = QLabel()
-        self.problem.setWordWrap(True)
-        form.addRow(self.problem)
-        scroll.setWidget(form_widget)
-        horizontal.addWidget(scroll, 1)
-        layout.addLayout(horizontal)
-        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
-        self.action = buttons.addButton("Submit" if share else "Save", QDialogButtonBox.ButtonRole.AcceptRole)
+            old_w, old_h = picture.reduced_from
+            pct = round(100 * (1 - w / old_w))
+            confirm(self.reduced_ok, f"The image size was reduced {pct}% ({old_w} × {old_h} px → {w} × {h} px) in order to meet the maximum upload size. Please check here to confirm this choice.")
+        else:
+            self.reduced_ok.hide()
+        form.addStretch()
+        scroll.setWidget(self.form_widget)
+        right.addWidget(scroll, 1)
+
+        self.work_status = _label("", 11)
+        self.work_status.setWordWrap(True)
+        self.work_bar = QProgressBar()
+        self.work_bar.setRange(0, 0)
+        self.work_bar.setTextVisible(False)
+        self.work_bar.setFixedHeight(4)
+        self.work_status.hide()
+        self.work_bar.hide()
+        right.addWidget(self.work_status)
+        right.addWidget(self.work_bar)
+        buttons = QHBoxLayout()
+        buttons.setSpacing(8)
+        self.action = QPushButton("Submit" if share else "Save")
+        self.action.setDefault(True)
         self.action.clicked.connect(self.action_pressed)
-        buttons.rejected.connect(self.reject)
-        layout.addWidget(buttons)
-        for field in [self.name_field, self.tags_field, self.credit_field, self.email_field]:
+        self.cancel_button = QPushButton("Cancel")
+        self.cancel_button.setAutoDefault(False)
+        self.cancel_button.clicked.connect(self.reject)
+        buttons.addWidget(self.action)
+        buttons.addWidget(self.cancel_button)
+        buttons.addStretch()
+        right.addLayout(buttons)
+        layout.addLayout(right)
+        for field in (self.name_field, self.credit_field):
             field.textChanged.connect(self.refresh)
-        self.category.currentTextChanged.connect(self.refresh)
-        self.description_field.textChanged.connect(self.refresh)
-        for box in (self.no_ai, self.png_ok, self.reduced_ok, self.official):
+        for box in (self.no_ai, self.png_ok, self.reduced_ok):
             box.toggled.connect(self.refresh)
         self.license.currentIndexChanged.connect(self.refresh)
+        watch_appearance(self._appearance)
+        self._appearance()
         self.refresh()
+        self.name_field.setFocus()
+
+    @property
+    def limit(self):
+        return BCLibrary.max_svg_bytes if self.pic.svg is not None else BCLibrary.max_png_bytes
+
+    def _appearance(self):
+        for label in self._secondary:
+            _set_ink(label, Theme.secondary_ink())
+        for label in self._errors:
+            _set_ink(label, Theme.error_ink())
+        self.action.setStyleSheet(f"QPushButton:enabled {{ background: {Theme.accent.name()}; color: black; }}")
+
+    def set_work(self, text):
+        self.working = bool(text)
+        self.form_widget.setEnabled(not self.working)
+        self.cancel_button.setEnabled(not self.working)
+        self.work_status.setText(text)
+        self.work_status.setVisible(self.working)
+        self.work_bar.setVisible(self.working)
+        self.refresh()
+
+    def reject(self):
+        if not self.working:
+            super().reject()
 
     @property
     def tags(self):
         seen, tags = set(), []
         for text in self.tags_field.text().split(","):
-            text = text.strip()
+            text = text.strip()[:40]
             if text and text.casefold() not in seen:
                 seen.add(text.casefold())
                 tags.append(text)
+                if len(tags) == 20:
+                    break
         return tags
 
     def meta(self):
-        return BCLibrary.Meta(title=self.name_field.text().strip(), category=self.category.currentText().strip(),
-                              description=self.description_field.toPlainText().strip(), tags=self.tags,
-                              author=self.credit_field.text().strip() or "anonymous", license=self.license.currentData(),
+        return BCLibrary.Meta(title=self.name_field.text().strip()[:80], category=self.category.currentText().strip()[:60],
+                              description=self.description_field.toPlainText().strip()[:500], tags=self.tags,
+                              author=self.credit_field.text().strip()[:60] or "anonymous", license=self.license.currentData(),
                               generative_ai_used=False if self.no_ai.isChecked() else None,
                               email=self.email_field.text().strip(), official=self.official.isChecked())
 
     def refresh(self, *_):
-        why = None
-        meta = self.meta()
-        # Validation requiring image decoding stays in the worker; form validation is cheap.
-        for key, n in [("title", 80), ("category", 60), ("description", 500), ("author", 60)]:
-            if len(getattr(meta, key)) > n:
-                why = f"{key.capitalize()} must be at most {n} characters"
-        if not meta.title:
+        cc_by = self.license.model().item(1)
+        no_ai = self.no_ai.isChecked()
+        cc_by.setEnabled(no_ai)
+        cc_by.setToolTip("" if no_ai else BCLibrary.cc_by_needs_no_ai)
+        if not no_ai and self.license.currentIndex() == 1:
+            self.license.setCurrentIndex(0)
+        why = ""
+        if not self.name_field.text().strip():
             why = "Give it a name first"
-        if len(meta.tags) > 20 or any(len(t) > 40 for t in meta.tags):
-            why = "Use at most 20 tags, each at most 40 characters"
-        if self.share and meta.license == "CC-BY-4.0":
-            if not self.no_ai.isChecked():
-                why = BCLibrary.cc_by_needs_no_ai
-            elif meta.author == "anonymous":
-                why = "CC BY needs a name to credit, or choose CC0"
-        if self.share and BCLibrary.check_email(meta.email) is None:
-            why = "The email address is invalid"
-        if self.pic.bytes > 2 * 1024 * 1024:
-            why = "Too large: simplify the drawing first"
-        if not self.pic.svg and not self.png_ok.isChecked():
+        elif self.share and self.license.currentData() == "CC-BY-4.0" and self.credit_field.text().strip() in ("", "anonymous"):
+            why = "CC BY needs a name to credit, or choose CC0"
+        elif self.pic.bytes > self.limit:
+            why = "Too large: simplify it first"
+        elif self.pic.svg is None and not self.png_ok.isChecked():
             why = "Confirm adding it as a PNG first"
-        if self.pic.reduced_from and not self.reduced_ok.isChecked():
+        elif self.pic.reduced_from and not self.reduced_ok.isChecked():
             why = "Confirm adding it at the reduced size first"
-        self.problem.setText(why or "")
-        self.action.setEnabled(why is None)
+        self.action.setToolTip(why)
+        self.action.setEnabled(not why and not self.working)
 
     def action_pressed(self):
         self.refresh()
@@ -487,43 +642,91 @@ class BCLibraryDialog(QDialog):
 
 class BCLibraryMixin:
     def bio_cartoon_library_items(self, path):
-        return [("Add to Local BioCartoon Library…", lambda: self.add_to_bio_cartoon_library(path, False)),
-                ("Upload to Online BioCartoon Library…", lambda: self.add_to_bio_cartoon_library(path, True))]
+        local = ("Add to Local BioCartoon Library…", lambda: self.add_to_bio_cartoon_library(path),
+                 "Keep this picture in Your library, on this computer")
+        title = "Upload to Online BioCartoon Library…"
+        try:
+            submitted = yield run_blocking(BCLibrary.was_submitted, path)
+        except (OSError, sqlite3.Error) as exc:
+            return [local, (title, None, str(exc))]
+        if submitted:
+            return [local, (title, None, BCLibrary.already_submitted)]
+        return [local, (title, lambda: self.add_to_bio_cartoon_library(path, True),
+                        "Submit this picture to the shared BioCartoon library")]
 
     def add_to_bio_cartoon_library(self, path, share=False):
         spawn(self._open_bio_library(path, share))
 
     def _open_bio_library(self, path, share):
+        path = Path(path)
+        if not path.is_file():
+            self.toast("Could not read the picture: " + str(path), error=True)
+            return
+        if origin := (yield run_blocking(BioCartoonCLI.origin, path)):
+            self.show_bio_cartoon_credit(origin)
+            return
+        cli = BioCartoonCLI(self.runtime)
         try:
-            cli = BioCartoonCLI(self.runtime)
             yield cli.usable()
+        except Exception as exc:
+            self.toast(f"BioCartoon needs installing or updating: open Insert ▸ BioCartoon Icons…\n{exc}", error=True)
+            return
+        try:
             catalog = yield cli.catalog_path()
-            if not catalog:
-                raise ValueError("The BioCartoon catalog is not downloaded: open BioCartoon Icons first")
-            if share and (yield run_blocking(BCLibrary.was_submitted, path)):
-                raise ValueError(BCLibrary.already_submitted)
-            pic = yield run_blocking(BCLibrary.read, path)
-            categories = yield cli.categories()
-            dialog = BCLibraryDialog(path, pic, share, categories, self.window)
-            dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-            dialog.on_done = lambda d: self.finish_bio_cartoon_library(d, path, catalog)
-            dialog.open()
         except Exception as exc:
             self.toast(str(exc), error=True)
+            return
+        if not catalog or not Path(catalog).is_file():
+            self.toast("The BioCartoon catalog is not downloaded yet: open Insert ▸ BioCartoon Icons… first", error=True)
+            return
+        try:
+            pic = yield run_blocking(BCLibrary.read, path, fingerprint=share)
+        except Exception as exc:
+            self.toast(f"Could not read the picture: {exc}", error=True)
+            return
+        try:
+            if share and (yield run_blocking(BCLibrary.has_submission, pic.fingerprint)):
+                title = path.stem.replace("_", " ").replace("-", " ")
+                self.toast(f'"{title}" was submitted to the BioCartoon library already', error=True)
+                return
+        except (OSError, sqlite3.Error) as exc:
+            self.toast(str(exc), error=True)
+            return
+        try:
+            categories = yield cli.categories()
+        except Exception:
+            categories = ()
+        dialog = BCLibraryDialog(path, pic, share, categories, self.window)
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        dialog.on_done = lambda d: self.finish_bio_cartoon_library(d, path, catalog)
+        dialog.open()
+
+    @staticmethod
+    def _confirm_bio_cartoon_publication(parent, title, text):
+        box = QMessageBox(QMessageBox.Icon.Question, title, "", parent=parent)
+        box.setTextFormat(Qt.TextFormat.PlainText)
+        box.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+        box.setText(text)
+        box.setStandardButtons(QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel)
+        box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        box.setEscapeButton(QMessageBox.StandardButton.Cancel)
+        return box.exec() == QMessageBox.StandardButton.Ok
 
     def finish_bio_cartoon_library(self, d, path, catalog):
         meta = d.meta()
         target = BCLibrary.submit_url()
         if d.share:
+            if BCLibrary.check_email(meta.email) is None:
+                self.toast(f'''"{meta.email}" doesn't look like an email address''', error=True)
+                d.email_field.setFocus()
+                return False
             text = (f"Publish for review to {target}/submit?\n\nAsset: {path}\n"
                     + json.dumps(asdict(meta), ensure_ascii=False, indent=2)
                     + "\n\nYour asset and the metadata above (except email) will be public if approved. "
                     "You confirm you may share it under " + meta.license + ".")
-            if QMessageBox.question(d, "Confirm BioCartoon publication", text,
-                    QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel,
-                    QMessageBox.StandardButton.Cancel) != QMessageBox.StandardButton.Ok:
+            if not self._confirm_bio_cartoon_publication(d, "Confirm BioCartoon publication", text):
                 return False
-        d.action.setEnabled(False)
+        d.set_work(f"Submitting {meta.title}…" if d.share else f"Saving {meta.title}…")
         spawn(self._finish_bio_library(d, path, catalog, meta, target))
         return True
 
@@ -533,21 +736,28 @@ class BCLibraryMixin:
         try:
             pic = dialog.pic
             yield run_blocking(BCLibrary.validate, pic, meta, dialog.share)
+            if dialog.share:
+                fingerprint = pic.fingerprint or (yield run_blocking(BCLibrary.fingerprint, path))
+                if (yield run_blocking(BCLibrary.has_submission, fingerprint)):
+                    self.toast(f'"{meta.title}" was submitted to the BioCartoon library already', error=True)
+                    dialog.accept()
+                    return
             row = BCLibrary.Row(meta.title, meta.category, meta.description,
                                 meta.license if dialog.share else "", meta.author, meta.tags, meta.generative_ai_used)
             # Save first, including the vector; a failed network request never loses it.
             local = yield run_blocking(BCLibrary.save, pic, row, catalog)
             if dialog.share:
-                fingerprint = yield run_blocking(BCLibrary.fingerprint, path)
+                fallback = None
                 try:
                     id = yield run_blocking(BCLibrary.submit, pic, meta, target=target,
                                              confirmed=True, fingerprint=fingerprint)
                 except SVGRefused as exc:
                     reservation = exc.reservation
-                    answer = QMessageBox.question(dialog, "SVG refused — submit PNG instead?",
-                        f"{target}/submit refused the SVG: {exc}\n\nSubmit its PNG preview instead, with the same metadata and {meta.license} license? Your local library keeps the SVG.",
-                        QMessageBox.StandardButton.Ok | QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Cancel)
-                    if answer != QMessageBox.StandardButton.Ok:
+                    fallback = str(exc)
+                    width, height = pic.size
+                    if not self._confirm_bio_cartoon_publication(dialog, "SVG refused — submit PNG instead?",
+                            f"{target}/submit refused the SVG: {exc}\n\nAsset: {path} (its {width} × {height} px PNG preview)\n\n"
+                            f"Submit the PNG instead, with the same metadata and {meta.license} license? Your local library keeps the SVG."):
                         yield run_blocking(BCLibrary.finish_slot, reservation)
                         reservation = None
                         self.toast("Kept in your local library; not submitted")
@@ -567,19 +777,24 @@ class BCLibraryMixin:
                 except Exception as exc:
                     self.toast(f"Submitted for review ({id}); local record retained but could not associate its id: {exc}", error=True)
                 else:
-                    self.toast(f"Submitted for review ({id}); kept in your library")
+                    if fallback:
+                        self.toast(f'Submitted "{meta.title}" for review as a PNG (the SVG was refused: {fallback}). Your library keeps the SVG.')
+                    else:
+                        self.toast(f'Submitted "{meta.title}" for review. It is in your library now and shared once approved.')
             else:
-                self.toast("Added “" + meta.title + "” to your library")
+                self.toast(f'Added "{meta.title}" to your library')
             dialog.accept()
         except Exception as exc:
-            self.toast(("Saved in your local library, but not submitted: " if local else "Could not save: ") + str(exc), error=True)
+            text = (f'"{meta.title}" is in your library but was not submitted: {exc}' if local else
+                    f'Could not add "{meta.title}" to your library: {exc}')
+            self.toast(text, error=True)
             if local:
                 dialog.accept()
             else:
-                dialog.action.setEnabled(True)
+                dialog.set_work("")
         finally:
             if reservation:
                 yield run_blocking(BCLibrary.finish_slot, reservation)
             pane = getattr(self, "biocartoon_pane", None)
-            if pane:
+            if pane and local:
                 pane.reload()

@@ -15,12 +15,15 @@ import colorsys
 import glob
 import io
 import math
+import os
 import re
 import subprocess
 import sys
 import tempfile
+from collections.abc import Mapping
 from functools import lru_cache
 from pathlib import Path
+from typing import NamedTuple
 
 FW, FH = 14.222222222222221, 8.0          # manim frame in units; 1280 x 720 px
 DEFAULT_FONT = "DejaVu Sans" if sys.platform.startswith("linux") else "Helvetica Neue"
@@ -169,14 +172,24 @@ def _int(v, default=0) -> int:
 _font_cache: dict = {}
 
 
+class _FontconfigFace(NamedTuple):
+    families: tuple[str, ...]
+    file: str
+    index: int
+
+    def has_family(self, family: str) -> bool:
+        name = family.casefold()
+        return any(alias.casefold() == name for alias in self.families)
+
+
 @lru_cache(maxsize=256)
-def _fontconfig_match(family: str, bold: bool, italic: bool, fallback: bool) -> tuple[str, int] | None:
-    """Fontconfig's file/face match, accepting family substitution only when explicitly requested."""
+def _matched_fontconfig_face(family: str, bold: bool, italic: bool,
+                            env: frozenset[tuple[str, str]]) -> _FontconfigFace | None:
     escaped = re.sub(r"([\\,:-])", r"\\\1", family)
     pattern = escaped + (":weight=bold" if bold else ":weight=regular") + (":slant=italic" if italic else ":slant=roman")
     try:
         r = subprocess.run(["fc-match", "--format", "%{family}\n%{file}\n%{index}\n", pattern],
-                           capture_output=True, text=True, timeout=10)
+                           capture_output=True, text=True, timeout=10, env=dict(env))
     except FileNotFoundError as exc:
         raise RuntimeError("Fontconfig's fc-match is required for Linux font measurement; "
                            "install the fontconfig package.") from exc
@@ -185,24 +198,48 @@ def _fontconfig_match(family: str, bold: bool, italic: bool, fallback: bool) -> 
     if r.returncode:
         raise RuntimeError("Fontconfig font matching failed: " + r.stderr.strip())
     lines = r.stdout.splitlines()
-    if len(lines) < 3 or not lines[1]:
+    if len(lines) < 3 or not lines[1] or not os.path.isfile(lines[1]):
         return None
-    if not fallback and family.casefold() not in {f.strip().casefold() for f in lines[0].split(",")}:
+    families = tuple(name for alias in lines[0].split(",") if (name := alias.strip()))
+    try:
+        index = int(lines[2])
+    except ValueError:
         return None
-    return lines[1], int(lines[2])
+    return _FontconfigFace(families, lines[1], index) if families and index >= 0 else None
+
+
+def _fontconfig_match(family: str, bold: bool, italic: bool, fallback: bool, *,
+                      env: Mapping[str, str] | None = None) -> _FontconfigFace | None:
+    """Match a face, accepting family substitution only when explicitly requested."""
+    # Include the effective subprocess environment, not just FONTCONFIG_FILE: Fontconfig also uses
+    # paths such as HOME and the XDG directories, and fc-match itself is located via PATH.
+    match = _matched_fontconfig_face(family, bold, italic,
+                                     frozenset((os.environ if env is None else env).items()))
+    if match is not None and (fallback or match.has_family(family)):
+        return match
+    return None
+
+
+def resolve_font_family(family: str, *, env: Mapping[str, str] | None = None) -> str:
+    """Return Fontconfig's actual family, retaining the request if it names that face."""
+    match = _fontconfig_match(family, False, False, True, env=env)
+    return family if match is None or match.has_family(family) else match.families[0]
+
+
+@lru_cache(maxsize=256)
+def _linux_pil_face(file: str, index: int):
+    from PIL import ImageFont
+    return ImageFont.truetype(file, 1000, index=index)
 
 
 def _font(family: str, bold: bool, italic: bool, *, _fallback: bool = False):
     """PIL font at 1000 px/em, or None for an unavailable family (unless substitution is requested)."""
+    if sys.platform.startswith("linux"):
+        match = _fontconfig_match(family, bold, italic, _fallback)
+        return _linux_pil_face(match.file, match.index) if match else None
     key = (family.lower(), bold, italic, _fallback)
     if key in _font_cache:
         return _font_cache[key]
-    if sys.platform.startswith("linux"):
-        from PIL import ImageFont
-        match = _fontconfig_match(family, bold, italic, _fallback)
-        found = ImageFont.truetype(match[0], 1000, index=match[1]) if match else None
-        _font_cache[key] = found
-        return found
     want = ("bold " if bold else "") + ("italic" if italic else "")
     want = want.strip() or "regular"
     stem = family.split()[0].lower() if family.split() else family.lower()

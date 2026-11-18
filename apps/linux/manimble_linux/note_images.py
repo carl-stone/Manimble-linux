@@ -5,10 +5,10 @@ import re
 from pathlib import Path
 
 from PySide6.QtCore import QUrl
-from PySide6.QtGui import QImage, QTextCharFormat, QTextCursor, QTextDocument, QTextImageFormat
-from PySide6.QtWidgets import QApplication, QFileDialog, QTextEdit
+from PySide6.QtGui import QImage, QImageReader, QTextCharFormat, QTextCursor, QTextDocument, QTextImageFormat
+from PySide6.QtWidgets import QFileDialog, QTextEdit
 
-from .clipboard import PICTURE_EXTENSIONS, SlidePaste, pasted_picture, save_asset
+from .clipboard import PICTURE_EXTENSIONS, SlidePaste, normalize_image, save_asset
 from . import workers
 
 _PATH_PROPERTY = int(QTextCharFormat.Property.UserProperty) + 101
@@ -33,6 +33,10 @@ class NoteImages:
     types = PICTURE_EXTENSIONS
 
     @staticmethod
+    def editor_width(editor):
+        return min(360, max(80, editor.viewport().width() - 12))
+
+    @staticmethod
     def has(text):
         return NoteImages.regex.search(text) is not None
 
@@ -43,7 +47,9 @@ class NoteImages:
             if base is None:
                 return None
             file = Path(base) / file
-        image = QImage(str(file))
+        reader = QImageReader(str(file))
+        reader.setAutoTransform(True)
+        image = reader.read()
         if image.isNull():
             return None
         return NoteImageAttachment(path, image, max_width, markup)
@@ -88,7 +94,7 @@ class NoteImages:
                     if fmt.isImageFormat() and path:
                         out.append(str(fmt.property(_MARKUP_PROPERTY) or f"![]({path})") * fragment.text().count("\ufffc"))
                     else:
-                        out.append(fragment.text().replace("\ufffc", ""))
+                        out.append(fragment.text())
                 it += 1
             block = block.next()
             if block.isValid():
@@ -100,52 +106,78 @@ class NoteImages:
         return save_asset(data, ext or "png", into, "note")
 
     @staticmethod
-    def import_images(from_, into):
-        mime = from_.mimeData() if hasattr(from_, "mimeData") else from_
+    def pictures(mime):
+        """Snapshot eligible picture inputs, without retaining the live clipboard."""
         files = [("file", url.toLocalFile()) for url in mime.urls() if url.isLocalFile()
                  and Path(url.toLocalFile()).suffix.lower().lstrip(".") in NoteImages.types]
-        if not files and mime.hasText():
-            return None
-        if not files:
-            data = SlidePaste.png_data(mime)
-            if data:
-                files = [("data", data)]
-        if not files:
-            return None
+        if files or mime.hasText():
+            return files
+        data = SlidePaste.png_data(mime)
+        return [("data", data)] if data else []
+
+    @staticmethod
+    def _save_picture(picture, into):
+        kind, value = picture
+        if kind == "data":
+            return NoteImages.save(value, "png", into)
+        file = Path(value)
+        data = file.read_bytes()
+        # Preserve the original bytes and extension when Qt can display them.
+        # HEIF and other formats without a local Qt reader still work as PNG.
+        if QImage.fromData(data).isNull():
+            return NoteImages.save(normalize_image(data), "png", into)
+        return NoteImages.save(data, file.suffix.lower().lstrip("."), into)
+
+    @staticmethod
+    def import_pictures(pictures, into):
         paths = []
-        for picture in files:
-            paths.append((yield workers.run_blocking(pasted_picture, picture, into, "note")))
+        for picture in pictures:
+            paths.append((yield workers.run_blocking(NoteImages._save_picture, picture, into)))
         return paths
 
     @staticmethod
+    def import_images(from_, into):
+        mime = from_.mimeData() if hasattr(from_, "mimeData") else from_
+        pictures = NoteImages.pictures(mime)
+        if pictures:
+            return (yield from NoteImages.import_pictures(pictures, into))
+        return None
+
+    @staticmethod
     def choose(into, parent=None):
-        files, _ = QFileDialog.getOpenFileNames(parent, "Choose pictures for the speaker notes", "", "Pictures (*.png *.jpg *.jpeg *.tiff *.gif *.heic *.heif *.bmp *.webp)")
-        out = []
-        for file in files:
-            out.append((yield workers.run_blocking(pasted_picture, ("file", file), into, "note")))
-        return out
+        files, _ = QFileDialog.getOpenFileNames(
+            parent, "Choose pictures for the speaker notes", "",
+            "Pictures (" + " ".join(f"*.{ext}" for ext in sorted(NoteImages.types)) + ")",
+        )
+        return (yield from NoteImages.import_pictures([("file", file) for file in files], into))
 
     @staticmethod
     def insert(paths, tv, base, max_width=600):
+        if not paths:
+            return
         cursor = tv.textCursor()
         document = tv.document()
+        fmt = cursor.charFormat()
+        if fmt.isImageFormat():
+            fmt = QTextCharFormat()
         cursor.beginEditBlock()
         start, end = cursor.selectionStart(), cursor.selectionEnd()
         previous = document.characterAt(start - 1) if start > 0 else "\n"
         following = document.characterAt(end) if end < document.characterCount() - 1 else ""
         cursor.removeSelectedText()
         if previous not in ("\n", "\u2029"):
-            cursor.insertText("\n")
+            cursor.insertText("\n", fmt)
         for index, path in enumerate(paths):
             if index:
-                cursor.insertText("\n")
+                cursor.insertText("\n", fmt)
             attachment = NoteImages.attachment(path, base, max_width)
             if attachment:
                 document.addResource(QTextDocument.ResourceType.ImageResource, QUrl(path), attachment.image)
                 cursor.insertImage(attachment)
             else:
-                cursor.insertText(f"![]({path})")
-        if paths and following not in ("\n", "\u2029"):
-            cursor.insertText("\n")
+                cursor.insertText(f"![]({path})", fmt)
+        if following not in ("\n", "\u2029"):
+            cursor.insertText("\n", fmt)
+        cursor.setCharFormat(fmt)
         cursor.endEditBlock()
         tv.setTextCursor(cursor)

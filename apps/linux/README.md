@@ -26,7 +26,7 @@ Installation copies the application rather than linking to the checkout, so the 
 
 | Location | Contents |
 |---|---|
-| `$XDG_DATA_HOME/manimble/app/` | Copied engine, Linux front end, CLI, version and license |
+| `$XDG_DATA_HOME/manimble/app/` | Copied engine, Linux front end, CLI, version, license, icons and bundled fonts |
 | `$XDG_DATA_HOME/manimble/python/` | Private GUI and engine Python environment |
 | `$XDG_CONFIG_HOME/manimble/` | Nonsecret preferences |
 | `$XDG_CACHE_HOME/manimble/` | Renders, voice audio, the extraction model and downloads |
@@ -34,6 +34,8 @@ Installation copies the application rather than linking to the checkout, so the 
 | `$HOME/.local/bin/` | `manimble` and `manimbler` launchers |
 
 Unset or relative XDG variables use `~/.local/share`, `~/.config`, `~/.cache` and `~/.local/state`. Desktop and MIME registrations use the XDG data directory. Installation does not select a default file handler or change `mimeapps.list`.
+
+The desktop entry uses the Manimble application icon. The `.manimble` MIME type has its own document icon.
 
 ## Run
 
@@ -49,6 +51,8 @@ Open Manimble from the application launcher, or use:
 The launchers work from any current directory, including when installation paths contain spaces. `--help` does not start Qt. Add `~/.local/bin` to your shell's `PATH` if needed.
 
 Manimble edits a working copy and writes changed files back only on Save to Original. Authored symlinks and terminal commands operating on external assets can still change external files, so the working copy is not a sandbox. Save Project Copy preserves unsaved changes without changing the original association.
+
+On Linux, Manimble uses a private Fontconfig configuration for deck rendering and theme selection. It keeps your installed fonts and preferences, and substitutes locally available faces when a Mac theme face isn't installed. Comic Neue and Nunito Sans are bundled; nothing is downloaded at launch. Opening a deck doesn't change its font names. The terminal keeps its own font preference; for larger interface text, launch with e.g. `MANIMBLE_TEXT_SCALE=1.15`.
 
 Keynote `.key` and legacy `.ppt` conversions require macOS. Use `.pptx` on Linux. Extract Elements uses the IS-Net model (179 MB), downloaded on first use with its own consent and run on the CPU by the main private Python. Manual extraction and background fill do not need the model.
 

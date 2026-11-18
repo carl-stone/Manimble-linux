@@ -7,12 +7,14 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor, QImage
-from PySide6.QtWidgets import (QCheckBox, QColorDialog, QComboBox, QDialog,
-    QDialogButtonBox, QFileDialog, QFormLayout, QInputDialog, QLineEdit,
-    QMessageBox, QPushButton, QSpinBox)
+from PySide6.QtWidgets import (QAbstractSpinBox, QCheckBox, QColorDialog, QComboBox, QDialog,
+    QDialogButtonBox, QFileDialog, QGridLayout, QHBoxLayout, QLabel, QLineEdit,
+    QMessageBox, QSpinBox, QVBoxLayout)
 
 from . import prefs
-from .tasks import spawn
+from .style import Theme
+from .tasks import spawn, when_done
+from .widgets import add_copy_button
 
 
 def asset_result(value):
@@ -40,10 +42,24 @@ class SlideToolsMixin:
         """Queue non-object mutations with an immutable target; return their real reply."""
         req = dict(args)
         target = req.get("scene", self.scene_name)
+        failure, success = {
+            "slide": ("slide operation failed", req.get("op")),
+            "new_build": ("could not add a build", "added a build"),
+            "delete_build": ("could not delete the build", "deleted build"),
+            "page_numbers": ("could not write the slide numbers", None),
+        }.get(cmd, (f"{cmd} failed", None))
+        show_busy = bool(success) or cmd == "page_numbers"
+
         def work():
-            result = yield self.call(cmd, req)
+            if show_busy:
+                self.busy += 1
+            try:
+                result = yield self.call(cmd, req)
+            finally:
+                if show_busy:
+                    self.busy -= 1
             if result.get("ok") is False or result.get("error"):
-                self.toast(result.get("error", f"{cmd} failed"), error=True)
+                self.toast(result.get("error") or failure, error=True)
                 return result
             self.last_changed = result.get("changed")
             yield from self.reload_state()
@@ -57,14 +73,23 @@ class SlideToolsMixin:
                     self.scene_name = None
                     self.scene = None
                     self.selection = None
-                    self.canvas.stop = None
-                    self.canvas.update()
+                    self._clear_shown_scene()
+                    self.render_source()
+                    self.rebuild_steps()
                     self.rebuild_inspector()
             elif target and self.scene_name == target:
                 if "stop" in result:
                     self.stop_index = result["stop"]
                 yield from self.load_scene(target, keep_stop=True)
-            self.toast(result.get("message", "Saved"))
+            text = result.get("message") or success or "Saved"
+            if success:
+                text = text.title()
+                if cmd in ("new_build", "delete_build") or req.get("op") == "delete":
+                    text += f" — {self.actions.shortcut_text('undo')} to undo"
+            elif cmd == "page_numbers":
+                message = result.get("message")
+                text = "No change" if message == "no change" else f"Saved · {message or 'slide numbers'}"
+            self.toast(text)
             return result
         return self.submit(work)
 
@@ -88,23 +113,28 @@ class SlideToolsMixin:
                         width, height = (self.scene or {}).get("size", [1280, 720])
                         self.canvas.ghost = (image, width / 2 + r.get("cx", 0), height / 2 + r.get("cy", 0), r.get("w", image.width()), r.get("h", image.height()))
                         self.canvas.update()
-            except Exception as exc:
-                if self._insert_generation == generation:
-                    self.toast(str(exc), error=True)
+            except Exception:
+                # The provisional sprite is optional; only the actual insert reports failure.
+                return
         if kind != "pen":
             spawn(preview())
         def work():
             try:
-                r = yield self.call("insert", req)
+                self.busy += 1
+                try:
+                    r = yield self.call("insert", req)
+                finally:
+                    self.busy -= 1
                 if not r.get("ok"):
                     if on_fail:
                         on_fail()
                     else:
-                        self.toast(r.get("error", "Insert failed"), error=True)
+                        self.toast(r.get("error") or "insert failed", error=True)
                     return r
+                self.last_changed = r.get("changed")
                 yield from self.load_scene(context.scene, keep_stop=True)
                 yield from self.reload_state()
-                if self.scene_name == context.scene:
+                if kind != "pen" and self.scene_name == context.scene:
                     loc = f"{r.get('file', '')}:{r.get('line', 0)}"
                     for oid, obj in (self.scene or {}).get("objects", {}).items():
                         if obj.get("loc") == loc:
@@ -130,30 +160,68 @@ class SlideToolsMixin:
     def insert_table_pressed(self, style="word"):
         if not isinstance(style, str):
             style = style.data() if hasattr(style, "data") else "word"
+        context, epoch = self.edit_context, self._deck_epoch
         dialog = QDialog(self.window)
-        dialog.setWindowTitle(f"Insert {style} table")
-        form = QFormLayout(dialog)
+        dialog.setWindowTitle("Insert math table" if style == "math" else "Insert word table")
+        layout = QVBoxLayout(dialog)
+        margins = layout.contentsMargins()
+        dialog.setMinimumWidth(300 + margins.left() + margins.right())
+        prompt = QLabel("Rows and columns:")
+        prompt.setFont(Theme.font(13))
+        layout.addWidget(prompt)
+        fields = QHBoxLayout()
+        fields.setSpacing(8)
         rows, cols = QSpinBox(), QSpinBox()
-        for field in (rows, cols):
+        for name, field in (("Rows", rows), ("Columns", cols)):
             field.setRange(1, 999)
             field.setValue(3)
-        form.addRow("Rows", rows)
-        form.addRow("Columns", cols)
+            field.setFixedWidth(60)
+            field.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+            label = QLabel(name)
+            label.setBuddy(field)
+            fields.addWidget(label)
+            fields.addWidget(field)
+        fields.addStretch()
+        layout.addLayout(fields)
         buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
-        form.addRow(buttons)
+        insert = buttons.button(QDialogButtonBox.StandardButton.Ok)
+        insert.setText("Insert")
+        insert.setDefault(True)
+        layout.addWidget(buttons)
         buttons.accepted.connect(dialog.accept)
         buttons.rejected.connect(dialog.reject)
-        if dialog.exec() == QDialog.DialogCode.Accepted:
-            return self.insert("table", {"rows": rows.value(), "cols": cols.value(), "style": style})
+        if dialog.exec() == QDialog.DialogCode.Accepted and self._deck_epoch == epoch:
+            return self.insert("table", {"rows": rows.value(), "cols": cols.value(), "style": style}, context=context)
 
     def insert_image_pressed(self):
-        filename, _ = QFileDialog.getOpenFileName(self.window, "Insert picture", "", "Images (*.png *.jpg *.jpeg *.tif *.tiff *.gif *.bmp *.webp *.heic *.heif *.svg)")
-        if not filename:
+        if not self.workspace:
+            return
+        epoch = self._deck_epoch
+        filename, _ = QFileDialog.getOpenFileName(
+            self.window, "Choose an image to insert", "",
+            "Images (*.png *.jpg *.jpeg *.tif *.tiff *.gif *.bmp *.webp *.heic *.heif *.svg)",
+        )
+        if not filename or self._deck_epoch != epoch:
             return
         context = self.edit_context
+        deck = self.work_deck
+
         def work():
-            relative = yield from asset_result(self.save_asset(Path(filename)))
-            return (yield self.insert("image", {"file": str(relative), "path": str(self.work_deck / relative)}, context=context))
+            try:
+                relative = yield from asset_result(self.save_asset(Path(filename)))
+            except Exception as exc:
+                if self._deck_epoch == epoch:
+                    title = "Could not copy the image"
+                    box = QMessageBox(QMessageBox.Icon.Warning, "", title, QMessageBox.StandardButton.Ok, self.window)
+                    box.setTextFormat(Qt.TextFormat.PlainText)
+                    box.setInformativeText(str(exc))
+                    add_copy_button(box).setToolTip("Copy this message to the clipboard")
+                    box.exec()
+                return
+            if self._deck_epoch == epoch:
+                return (yield self.insert(
+                    "image", {"file": str(relative), "path": str(deck / relative)}, context=context,
+                ))
         return spawn(work()).future
 
     def slide_op(self, op, index=None, scene_override=None, layout=None):
@@ -182,6 +250,7 @@ class SlideToolsMixin:
     def toggle_hide_slide(self): return self.slide_op("unhide" if self.selected_slide_is_hidden else "hide")
     def new_build(self):
         if self.scene_name:
+            self.commit_drawer()
             return self.tool_command("new_build", {"scene": self.scene_name, "stop": self.stop_index})
     def delete_build(self):
         if self.scene_name and len((self.scene or {}).get("stops", [])) > 1:
@@ -194,6 +263,8 @@ class SlideToolsMixin:
         return self.tool_command("placeholder", req)
 
     def run_page_numbers(self, args, scene=None):
+        if not (scene or self.scene_name):
+            return
         return self.tool_command("page_numbers", dict(args, scene=scene or self.scene_name))
 
     def page_spread_picked(self, choice):
@@ -208,7 +279,7 @@ class SlideToolsMixin:
             return self.run_page_numbers({"op": "spread"}, scene)
         box = QMessageBox(self.window)
         box.setWindowTitle("Apply to all slides?")
-        box.setText("Give every slide's number the same position and style?")
+        box.setText("You changed this slide's number. Give every slide's number the same position and style?")
         all_button = box.addButton("Apply to All Slides", QMessageBox.ButtonRole.AcceptRole)
         one_button = box.addButton("Only This Slide", QMessageBox.ButtonRole.RejectRole)
         box.setDefaultButton(one_button)
@@ -218,6 +289,7 @@ class SlideToolsMixin:
         all_slides = box.clickedButton() is all_button
         if remember.isChecked():
             prefs.set(self.page_spread_key, "all" if all_slides else "one")
+            self.toast("Won't ask again · change this in Insert ▸ Slide Numbers…")
         if all_slides:
             return self.run_page_numbers({"op": "spread"}, scene)
 
@@ -225,55 +297,113 @@ class SlideToolsMixin:
         if not self.scene_name:
             return
         target = self.scene_name
+        epoch = self._deck_epoch
         def show():
             info = yield self.call("page_numbers", {"op": "get"})
+            if self._deck_epoch != epoch:
+                return
             dialog = QDialog(self.window)
             dialog.setWindowTitle("Slide numbers")
-            form = QFormLayout(dialog)
+            dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+            layout = QVBoxLayout(dialog)
+            prompt = QLabel(
+                "Every slide of the show gets a number: a Text at the top of its construct(). "
+                "The numbers follow along when slides are added, deleted or reordered."
+            )
+            prompt.setWordWrap(True)
+            prompt.setFont(Theme.font(13))
+            layout.addWidget(prompt)
+            fields = QGridLayout()
+            fields.setVerticalSpacing(7)
+            fields.setHorizontalSpacing(10)
+            fields.setColumnStretch(1, 1)
+            dialog.setMinimumWidth(300 + layout.contentsMargins().left() + layout.contentsMargins().right())
+            layout.addLayout(fields)
+
+            def add_field(row, caption, field):
+                label = QLabel(caption)
+                label.setFont(Theme.font(11))
+                label.setBuddy(field)
+                fields.addWidget(label, row, 0, Qt.AlignmentFlag.AlignRight)
+                fields.addWidget(field, row, 1, Qt.AlignmentFlag.AlignLeft)
+
             pos = QComboBox()
             for title, key in [("Bottom right", "DR"), ("Bottom center", "DOWN"), ("Bottom left", "DL")]: pos.addItem(title, key)
             pos.setCurrentIndex(max(0, pos.findData(info.get("pos", "DR"))))
             start, size = QSpinBox(), QSpinBox()
-            start.setRange(-999999, 999999); start.setValue(info.get("start", 1))
-            size.setRange(6, 200); size.setValue(info.get("size", 24))
-            form.addRow("Position", pos); form.addRow("Start at", start); form.addRow("Font size", size)
+            start.setRange(-999999, 999999)
+            start.setValue(info.get("start", 1))
+            size.setRange(6, 200)
+            size.setValue(info.get("size", 24))
+            for field in (start, size):
+                field.setButtonSymbols(QAbstractSpinBox.ButtonSymbols.NoButtons)
+                field.setFixedWidth(64)
+            add_field(0, "Position", pos)
+            add_field(1, "Start at", start)
+            add_field(2, "Font size", size)
             checks = {}
-            for key, title, default in [("skip", "Skip title slide", True), ("total", "Show total slides", True), ("sub", "Show sub-slide numbers", False)]:
-                checks[key] = QCheckBox(title); checks[key].setChecked(info.get(key, default)); form.addRow(checks[key])
+            for row, (key, title, default) in enumerate((
+                ("skip", "Skip title slide", True),
+                ("total", "Show total slides", True),
+                ("sub", "Show sub-slide numbers", False),
+            ), 3):
+                checks[key] = QCheckBox(title)
+                checks[key].setChecked(info.get(key, default))
+                fields.addWidget(checks[key], row, 1)
+            checks["sub"].setToolTip("Slides with several builds also count them: 29 / 47 · 1/3 rather than 29 / 47")
             spread = QComboBox()
             for title, value in self.page_spread_choices: spread.addItem(title, value)
             spread.setCurrentIndex(max(0, spread.findData(prefs.get_str(self.page_spread_key))))
             spread.currentIndexChanged.connect(lambda _: self.page_spread_picked(spread))
-            form.addRow("When one is changed", spread)
-            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Apply | QDialogButtonBox.StandardButton.Cancel)
-            buttons.button(QDialogButtonBox.StandardButton.Apply).setText("Update Numbers" if info.get("on") else "Add Numbers")
-            buttons.button(QDialogButtonBox.StandardButton.Apply).clicked.connect(lambda: (self.run_page_numbers({"op": "set", "pos": pos.currentData(), "start": start.value(), "size": size.value(), **{k: c.isChecked() for k, c in checks.items()}}, target), dialog.accept()))
+            add_field(6, "When one is changed", spread)
+            buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+            apply = buttons.button(QDialogButtonBox.StandardButton.Ok)
+            apply.setText("Update Numbers" if info.get("on") else "Add Numbers")
+            apply.setDefault(True)
+
+            def change(args):
+                dialog.accept()
+                if epoch == self._deck_epoch:
+                    self.run_page_numbers(args, target)
+
+            buttons.accepted.connect(lambda: change({
+                "op": "set", "pos": pos.currentData(), "start": start.value(), "size": size.value(),
+                **{key: box.isChecked() for key, box in checks.items()},
+            }))
             buttons.rejected.connect(dialog.reject)
             if info.get("on"):
                 remove = buttons.addButton("Remove Numbers", QDialogButtonBox.ButtonRole.DestructiveRole)
-                remove.clicked.connect(lambda: (self.run_page_numbers({"op": "remove"}, target), dialog.accept()))
-            form.addRow(buttons)
+                remove.clicked.connect(lambda: change({"op": "remove"}))
+            layout.addWidget(buttons)
             self._page_numbers_dialog = dialog
+            dialog.finished.connect(lambda _: setattr(self, "_page_numbers_dialog", None))
             dialog.open()
-        return spawn(show())
+        return self._watch(spawn(show()).future)
 
     def set_pen_color(self, color):
         self.canvas.pen_color = QColor(color)
-        prefs.set("penColor", self.canvas.pen_color.name().upper())
-        self.set_draw_tool("pen")
+        hex_color = self.canvas.pen_color.name().upper()
+        prefs.set("penColor", hex_color)
+        if self.canvas.draw_tool == "pen":
+            self.toast(f"Pen colour {hex_color}")
+        else:
+            self.set_draw_tool("pen")
     def pen_color_chosen(self, color): self.set_pen_color(color if isinstance(color, str) else color.data())
     def pen_color_panel(self):
         c = QColorDialog.getColor(getattr(self.canvas, "pen_color", QColor("#FF3B30")), self.window)
         if c.isValid(): self.set_pen_color(c)
     def pen_panel_changed(self, color): self.set_pen_color(color)
     def pen_finished(self, points):
-        return self.insert("pen", {"points": [[p.x(), p.y()] if hasattr(p, "x") else list(p) for p in points], "color": self.canvas.pen_color.name().upper(), "width": getattr(self.canvas, "pen_width", 6)})
+        return self.insert("pen", {
+            "points": [[p.x(), p.y()] if hasattr(p, "x") else list(p) for p in points],
+            "color": self.canvas.pen_color.name().upper(),
+            "width": self.canvas.pen_width,
+        })
 
     def save_presenter_notes(self, scene, build, text, done):
         req = {"op": "set", "scene": scene, "text": text}
         if build is not None: req["stop"] = build
         future = self.tool_command("notes", req)
-        from .tasks import when_done
         when_done(future, lambda f: done(not f.exception() and f.result().get("ok", False)))
         return future
 
@@ -313,16 +443,45 @@ class HyperlinkMixin:
         if text.startswith(("/", "~")): return Path(text).expanduser().absolute().as_uri()
         return "https://" + text
 
-    def commit_link(self, value, oid=None):
-        oid = self.selection if oid is None else oid
-        if oid is not None:
-            req = {"op": "link", "oid": oid, "url": self.normalized_link(value)}
-            return self.submit(lambda: self.run_edit(req))
-
     def hyperlink_pressed(self):
         obj = self.obj_info or {}
         if obj.get("kind") not in ("text", "tex"): return
         oid = self.selection
-        current = (obj.get("format") or {}).get("link", "")
-        text, ok = QInputDialog.getText(self.window, "Edit Hyperlink" if current else "Add Hyperlink", "URL (empty removes the link)", text=current)
-        if ok and self.normalized_link(text) != current: return self.commit_link(text, oid)
+        context, epoch = self.edit_context, self._deck_epoch
+        current = (obj.get("format") or {}).get("link")
+        dialog = QDialog(self.window)
+        dialog.setWindowTitle("Edit Hyperlink" if current is not None else "Add Hyperlink")
+        layout = QVBoxLayout(dialog)
+        prompt = QLabel("Clicking this text in a slideshow or Presenter View opens the link.")
+        prompt.setMaximumWidth(320)
+        prompt.setWordWrap(True)
+        prompt.setFont(Theme.font(13))
+        layout.addWidget(prompt)
+        field = QLineEdit(current or "")
+        field.setAccessibleName("URL")
+        field.setPlaceholderText("https://example.com")
+        field.setFixedWidth(320)
+        field.setMinimumHeight(24)
+        layout.addWidget(field)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setDefault(True)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        remove_result = 2
+        if current is not None:
+            remove = buttons.addButton("Remove Link", QDialogButtonBox.ButtonRole.DestructiveRole)
+            remove.clicked.connect(lambda: dialog.done(remove_result))
+        layout.addWidget(buttons)
+        field.setFocus()
+        result = dialog.exec()
+        if result == remove_result:
+            value = ""
+        elif result == QDialog.DialogCode.Accepted:
+            value = self.normalized_link(field.text())
+        else:
+            return
+        if value != (current or "") and epoch == self._deck_epoch:
+            req = {"op": "link", "oid": oid, "url": value, "scene": context.scene, "stop": context.stop}
+            if context.seen:
+                req["seen"] = context.seen
+            return self.submit(lambda: self.run_edit(req))

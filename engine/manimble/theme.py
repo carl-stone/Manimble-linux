@@ -12,6 +12,7 @@ import ast
 import os
 import re
 import sys
+from collections.abc import Mapping
 
 from . import darkmode as dm
 from .srcedit import Edit, py_str
@@ -25,8 +26,8 @@ SLIDE_KEYS = ("FONT", "TEXT_COLOR", "MUTED_COLOR", "ACCENT")
 MARK = "# manimble theme"
 
 
-def load(theme_id: str) -> dict:
-    """{constant: value} of themes/<theme_id>.py."""
+def load(theme_id: str, *, env: Mapping[str, str] | None = None) -> dict:
+    """{constant: value} of themes/<theme_id>.py, resolving bundled Mac fonts on Linux."""
     if not re.fullmatch(r"[\w-]+", theme_id or ""):
         raise ValueError(f"no theme {theme_id!r}")
     path = os.path.join(DIR, theme_id + ".py")
@@ -45,9 +46,8 @@ def load(theme_id: str) -> dict:
         font = out.get("FONT")
         mac_fonts = {"Menlo", "Palatino", "Helvetica Neue", "Chalkboard SE", "Avenir Next"}
         if font in mac_fonts:
-            from .importer import _font
-            if _font(font, False, False) is None:
-                out["FONT"] = {"Menlo": "DejaVu Sans Mono", "Palatino": "DejaVu Serif"}.get(font, "DejaVu Sans")
+            from .importer import resolve_font_family
+            out["FONT"] = resolve_font_family(font, env=env)
     return out
 
 

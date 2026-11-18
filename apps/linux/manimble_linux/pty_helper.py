@@ -26,6 +26,13 @@ def login_shell(env: dict[str, str]) -> str:
     return found if found and os.access(found, os.X_OK) else "/bin/sh"
 
 
+def terminal_directory(directory: Path, repository: bool = False) -> Path:
+    if repository:
+        return next((parent for parent in (directory, *directory.parents)
+                     if (parent / ".git").exists()), directory.parent)
+    return directory
+
+
 def processes(session: int) -> list[tuple[int, int, str]]:
     result = []
     for entry in Path("/proc").iterdir():
@@ -56,10 +63,7 @@ def main() -> int:
     if args.original:
         env["MANIMBLE_ORIGINAL_DECK"] = args.original
     shell = login_shell(env)
-    directory = Path(args.cwd)
-    if args.repository:
-        directory = next((parent for parent in (directory, *directory.parents)
-                          if (parent / ".git").exists()), directory.parent)
+    directory = terminal_directory(Path(args.cwd), args.repository)
     pid, master = pty.fork()
     if pid == 0:
         try:

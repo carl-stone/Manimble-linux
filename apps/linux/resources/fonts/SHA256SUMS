@@ -1,0 +1,11 @@
+# Upstream: https://github.com/google/fonts/tree/5bd87dfc525c8a0d1d8529d3684716e00c3fc59a/ofl
+# Download base: https://raw.githubusercontent.com/google/fonts/5bd87dfc525c8a0d1d8529d3684716e00c3fc59a/ofl/
+# Append the relative path (URL-encode square brackets). Verify from this directory: sha256sum -c SHA256SUMS
+a0ee5a37c8b27c4db0700137d928598b1e23b0089e1546a8961909176b779360  comicneue/ComicNeue-Regular.ttf
+e06bfd1552f5c9464c5665733ffd69239b0593885dbb9e059688a5900f78cf98  comicneue/ComicNeue-Italic.ttf
+3e7e5fccfd7e0788f317b43312151c1bd5cf058c9697a8d83eac3939050bd61e  comicneue/ComicNeue-Bold.ttf
+5c312c2a2fa64eee82f3b87fcfab8f3b12a5e59b043124401d322eb323cfbf16  comicneue/ComicNeue-BoldItalic.ttf
+7c38a22e5878e60fe423360553e63dd7be23d29f1f60336034935dbfc96e8320  comicneue/OFL.txt
+f934d7142fb4784bf828da485b7dcbd90c0c80d514e9d49a5da0ed3a1ae2491d  nunitosans/NunitoSans[YTLC,opsz,wdth,wght].ttf
+d9d5db18f3c11221a4fbb553cbc709391c1179964c7eaa4466ef43c78aa4492f  nunitosans/NunitoSans-Italic[YTLC,opsz,wdth,wght].ttf
+efbb0c9e864cef973982d9a17567e6be5c3d1759695574586f3f18c7ecca064b  nunitosans/OFL.txt

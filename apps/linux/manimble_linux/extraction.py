@@ -5,21 +5,23 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from enum import Enum
 import math
-import os
 from pathlib import Path
 import tempfile
 import shutil
 
 import numpy as np
 from PIL import Image, ImageFilter, ImageOps
-from PySide6.QtCore import QPointF, QRectF, Qt, QTimer
-from PySide6.QtGui import QColor, QImage, QKeySequence, QPainter, QPen, QShortcut
-from PySide6.QtWidgets import (QButtonGroup, QCheckBox, QDialog, QHBoxLayout,
-    QLabel, QMessageBox, QProgressBar, QPushButton, QSlider, QVBoxLayout, QWidget)
+from PySide6.QtCore import QRectF, QSize, Qt, QTimer
+from PySide6.QtGui import QColor, QFont, QImage, QKeySequence, QPainter, QPainterPath, QPalette, QPen, QShortcut
+from PySide6.QtWidgets import (QApplication, QButtonGroup, QCheckBox, QDialog, QHBoxLayout,
+    QLabel, QMessageBox, QProgressBar, QPushButton, QSizePolicy, QSlider, QVBoxLayout, QWidget)
 
 from .extract_runtime import DISCLOSURE, ExtractRuntime
+from .icons import template_icon
 from .models import Box, stop_box
+from .style import Theme, is_dark, watch_appearance
 from .tasks import spawn
+from .widgets import hairline
 from .workers import WorkerProcess, run_blocking
 
 
@@ -276,6 +278,16 @@ def build_insert_request(scene,stop,first_shown,oid,box,image_size,parts,backgro
     return request
 
 
+class _NothingToExtract(ValueError):
+    pass
+
+
+class _SaveExtractionError(OSError):
+    def __init__(self, filename, error):
+        super().__init__(str(error))
+        self.filename = filename
+
+
 def save_parts(image,masks,deck,stem,filled=None):
     """Write collision-safe editable assets; remove only our files on partial failure."""
     deck = Path(deck)
@@ -290,9 +302,14 @@ def save_parts(image,masks,deck,stem,filled=None):
                 break
             except FileExistsError:
                 k += 1
+            except OSError as error:
+                raise _SaveExtractionError(file, error) from error
         created.append(deck/file)
-        with stream:
-            img.save(stream,format="PNG")
+        try:
+            with stream:
+                img.save(stream, format="PNG")
+        except Exception as error:
+            raise _SaveExtractionError(file, error) from error
         return file
     try:
         parts = []
@@ -301,7 +318,7 @@ def save_parts(image,masks,deck,stem,filled=None):
             if part:
                 parts.append((save(part.image,"part"),part.box))
         if not parts:
-            raise ValueError("Nothing to extract")
+            raise _NothingToExtract("Nothing to extract")
         background = save(filled,"background") if filled is not None else None
         return parts,background
     except Exception:
@@ -325,6 +342,47 @@ def _stage(image,masks,directory):
     return image_file,hole_file
 
 
+class _Spinner(QWidget):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setFixedSize(14, 14)
+        self._angle = 0
+        self._timer = QTimer(self)
+        self._timer.setInterval(70)
+        self._timer.timeout.connect(self._advance)
+
+    def _advance(self):
+        self._angle = (self._angle - 45) % 360
+        self.update()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self._timer.start()
+
+    def hideEvent(self, event):
+        self._timer.stop()
+        super().hideEvent(event)
+
+    def paintEvent(self, event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setPen(QPen(Theme.tertiary_ink(), 1.5))
+        ring = QRectF(self.rect()).adjusted(2, 2, -2, -2)
+        p.drawEllipse(ring)
+        pen = QPen(Theme.secondary_ink(), 1.5)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.drawArc(ring, self._angle * 16, 100 * 16)
+
+
+@dataclass
+class _ExtractionJob:
+    text: str
+    generation: int
+    worker: WorkerProcess | None = None
+    progress: float | None = None
+
+
 class ExtractEditor(QDialog):
     Tool = Tool
     colors = ("#7D5CFF","#33C759","#FF992E","#4DB3FF","#FF458C","#F2D91A")
@@ -335,8 +393,9 @@ class ExtractEditor(QDialog):
         fill: bool
         filled: Image.Image | None
 
-    def __init__(self,image,masks=(),source="the picture",runtime=None,extract_runtime=None,parent=None):
+    def __init__(self, image, masks=(), source="the picture", runtime=None, extract_runtime=None, parent=None):
         super().__init__(parent)
+        self.setFont(Theme.font(13))
         self.setWindowTitle("Extract Elements")
         self.setWindowModality(Qt.WindowModality.WindowModal)
         self.resize(960,680)
@@ -346,11 +405,10 @@ class ExtractEditor(QDialog):
         self.state.on_change = self.changed
         self._temporary = tempfile.TemporaryDirectory(prefix="manimble-extract-")
         self._workers = set()
-        self._preview_worker = None
-        self._model_worker = None
+        self._jobs = {}
+        self._status_text = ""
         self._closed = False
         self._operations = 0
-        self._operation_epoch = 0
         self._insert_pending = False
         self._serial = 0
         self._finish = None
@@ -358,76 +416,120 @@ class ExtractEditor(QDialog):
         self._overlays = {}
         self._image = _qimage(self.state.image)
         self._filled_image = None
-        self._last_preview_generation = -1
         layout = QVBoxLayout(self)
-        layout.addWidget(QLabel(f"Extract elements from {source}"))
+        layout.setContentsMargins(18, 16, 18, 14)
+        layout.setSpacing(10)
+        heading = QLabel(f"Extract elements from {source or 'the picture'}")
+        heading.setTextFormat(Qt.TextFormat.PlainText)
+        heading.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        heading.setFont(Theme.font(13, QFont.Weight.DemiBold))
+        layout.addWidget(heading)
+
         row = QHBoxLayout()
+        row.setSpacing(8)
+        self.segments = QWidget()
+        segments = QHBoxLayout(self.segments)
+        segments.setContentsMargins(0, 0, 0, 0)
+        segments.setSpacing(0)
         self.tool_control = QButtonGroup(self)
-        for tool in Tool:
-            button = QPushButton(tool.value)
+        self._tool_buttons = {}
+        tools = (
+            (Tool.box, "rectangle.dashed", "Drag a box around something to add it as an element (B)"),
+            (Tool.keep, "plus.circle", "Paint over parts the selected element should include (K)"),
+            (Tool.remove, "minus.circle", "Paint over parts the selected element should leave out (R)"),
+        )
+        for index, (tool, symbol, tip) in enumerate(tools):
+            button = self._button(tool.value, lambda t=tool: self.set_tool(t), size=12, tip=tip)
+            button.setObjectName(("firstSegment", "middleSegment", "lastSegment")[index])
+            button.setAccessibleName(tool.value)
+            button.setIcon(template_icon(symbol, button))
+            button.setIconSize(QSize(14, 14))
             button.setCheckable(True)
             button.setChecked(tool == Tool.box)
             self.tool_control.addButton(button)
-            button.clicked.connect(lambda checked,t=tool:self.set_tool(t))
-            row.addWidget(button)
-        row.addWidget(QLabel("Brush"))
+            self._tool_buttons[tool] = button
+            segments.addWidget(button)
+        row.addWidget(self.segments)
+        self.brush_label = QLabel("Brush")
+        self.brush_label.setFont(Theme.font(13))
+        row.addWidget(self.brush_label)
         self.brush_slider = QSlider(Qt.Orientation.Horizontal)
         self.brush_slider.setRange(3,60)
         self.brush_slider.setValue(14)
-        self.brush_slider.setMaximumWidth(110)
+        self.brush_slider.setFixedWidth(110)
+        self.brush_slider.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        self.brush_slider.setAccessibleName("Brush")
         self.brush_slider.valueChanged.connect(self.brush_changed)
         row.addWidget(self.brush_slider)
         row.addStretch()
-        self.detect_button = QPushButton("Find Elements")
-        self.detect_button.clicked.connect(self.detect_pressed)
+        self.spinner = _Spinner(self)
+        row.addWidget(self.spinner)
+        self.detect_button = self._button("Find Elements", self.detect_pressed,
+            tip="Add every separate subject the picture's model finds")
         row.addWidget(self.detect_button)
-        self.whole_box = QPushButton("Whole Box")
-        self.whole_box.clicked.connect(self.state.whole_box_pressed)
+        self.whole_box = self._button("Whole Box", self.state.whole_box_pressed,
+            tip="Cut out the selected element's whole box instead of the shape found inside it")
         row.addWidget(self.whole_box)
-        self.delete_button = QPushButton("Delete")
-        self.delete_button.clicked.connect(self.state.delete_selected)
+        self.delete_button = self._button("Delete", self.state.delete_selected)
         row.addWidget(self.delete_button)
-        self.clear_button = QPushButton("Clear All")
-        self.clear_button.clicked.connect(self.state.clear_pressed)
+        self.clear_button = self._button("Clear All", self.state.clear_pressed)
         row.addWidget(self.clear_button)
         layout.addLayout(row)
         self.canvas = ExtractCanvas(self)
         layout.addWidget(self.canvas,1)
         self.hint = QLabel()
+        self.hint.setFont(Theme.font(11.5))
         self.hint.setWordWrap(True)
         layout.addWidget(self.hint)
+
+        self.model_row = QWidget()
+        model_row = QHBoxLayout(self.model_row)
+        model_row.setContentsMargins(0, 0, 0, 0)
+        model_row.setSpacing(8)
+        self.model_help = QLabel()
+        self.model_help.setFont(Theme.font(11))
+        self.model_help.setWordWrap(True)
+        model_row.addWidget(self.model_help, 1)
+        self.install_button = self._button("Download extraction model…", self.install_model)
+        model_row.addWidget(self.install_button)
+        layout.addWidget(self.model_row)
+
+        self.work_row = QWidget()
+        work_row = QHBoxLayout(self.work_row)
+        work_row.setContentsMargins(0, 0, 0, 0)
+        work_row.setSpacing(8)
         self.status = QLabel()
+        self.status.setTextFormat(Qt.TextFormat.PlainText)
+        self.status.setFont(Theme.font(11))
         self.status.setWordWrap(True)
         self.status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self.status)
-        progress_row = QHBoxLayout()
-        self.install_button = QPushButton("Download extraction model…")
-        self.install_button.clicked.connect(self.install_model)
-        progress_row.addWidget(self.install_button)
+        work_row.addWidget(self.status, 1)
         self.progress = QProgressBar()
-        self.progress.setRange(0,100)
-        self.progress.hide()
-        progress_row.addWidget(self.progress,1)
-        self.cancel_work = QPushButton("Cancel operation")
-        self.cancel_work.clicked.connect(self.cancel_operation)
-        self.cancel_work.hide()
-        progress_row.addWidget(self.cancel_work)
-        layout.addLayout(progress_row)
+        self.progress.setFont(Theme.font(10))
+        self.progress.setFixedWidth(104)
+        work_row.addWidget(self.progress)
+        self.cancel_work = self._button("Cancel operation", self.cancel_operation)
+        work_row.addWidget(self.cancel_work)
+        layout.addWidget(self.work_row)
+        layout.addWidget(hairline(self))
+
         row = QHBoxLayout()
+        row.setSpacing(8)
+        options = QHBoxLayout()
+        options.setSpacing(16)
         self.fill_box = QCheckBox("Fill in the background behind them")
+        self.fill_box.setToolTip("Replace the picture with a copy where a best guess of what is behind each element is painted in, so the elements can be moved away")
         self.fill_box.setChecked(True)
         self.fill_box.toggled.connect(self.fill_changed)
-        row.addWidget(self.fill_box)
+        options.addWidget(self.fill_box)
         self.preview_box = QCheckBox("Preview background")
         self.preview_box.toggled.connect(self.preview_changed)
-        row.addWidget(self.preview_box)
+        options.addWidget(self.preview_box)
+        row.addLayout(options)
         row.addStretch()
-        cancel = QPushButton("Cancel")
-        cancel.clicked.connect(self.reject)
-        row.addWidget(cancel)
-        self.insert_button = QPushButton("Insert")
+        row.addWidget(self._button("Cancel", self.reject, size=13))
+        self.insert_button = self._button("Insert", self.insert_pressed, size=13)
         self.insert_button.setDefault(True)
-        self.insert_button.clicked.connect(self.insert_pressed)
         row.addWidget(self.insert_button)
         layout.addLayout(row)
         self._shortcuts = []
@@ -437,10 +539,66 @@ class ExtractEditor(QDialog):
             self._shortcuts.append(shortcut)
         self.finished.connect(self._finished)
         self.refresh_controls()
+        self._appearance_changed()
+        watch_appearance(self._appearance_changed)
 
-    def run(self,on=None,done=None):
-        if on is not None:
-            self.setParent(on,self.windowFlags())
+    def _button(self, text, action, *, size=11, tip=""):
+        button = QPushButton(text)
+        button.setFont(Theme.font(size))
+        button.setFocusPolicy(Qt.FocusPolicy.TabFocus)
+        button.setAutoDefault(False)
+        button.setToolTip(tip)
+        button.clicked.connect(lambda _checked=False: action())
+        return button
+
+    def _appearance_changed(self):
+        border = Theme.separator().name(QColor.NameFormat.HexArgb)
+        selected = Theme.accent_soft.name(QColor.NameFormat.HexArgb)
+        pressed = Theme.ink(.09).name(QColor.NameFormat.HexArgb)
+        sheet = f"""
+            QPushButton {{
+                background: transparent;
+                border: 1px solid {border};
+                min-height: 18px;
+                padding: 2px 5px;
+            }}
+            QPushButton:checked {{ background: {selected}; }}
+            QPushButton:pressed {{ background: {pressed}; }}
+            QPushButton:focus {{ border-color: palette(highlight); }}
+            QPushButton#firstSegment {{ border-top-left-radius: 5px; border-bottom-left-radius: 5px; }}
+            QPushButton#middleSegment, QPushButton#lastSegment {{ border-left: none; }}
+            QPushButton#lastSegment {{ border-top-right-radius: 5px; border-bottom-right-radius: 5px; }}
+        """
+        if self.segments.styleSheet() != sheet:
+            self.segments.setStyleSheet(sheet)
+        for label in (self.hint, self.model_help, self.status):
+            self._ink_label(label, Theme.secondary_ink())
+        self._refresh_brush()
+        self.canvas.update()
+
+    @staticmethod
+    def _ink_label(label, color):
+        palette = label.palette()
+        if palette.color(QPalette.ColorRole.WindowText) != color:
+            palette.setColor(QPalette.ColorRole.WindowText, color)
+            label.setPalette(palette)
+
+    def _refresh_brush(self):
+        painting = self.state.tool != Tool.box
+        self.brush_slider.setEnabled(painting)
+        self._ink_label(self.brush_label, Theme.secondary_ink() if painting else Theme.tertiary_ink())
+
+    def run(self, on=None, done=None):
+        if on is not None and on is not self.parentWidget():
+            self.setParent(on, self.windowFlags())
+        if parent := self.parentWidget():
+            room = parent.contentsRect()
+            width, height = max(1, room.width()-20), max(1, room.height()-20)
+            w, h = self.state.w, self.state.h
+            fit = max(0, min((width-20-36)/w, (height-20-190)/h, 1.5))
+            self.canvas.setMinimumHeight(min(300, max(0, height-220)))
+            self.setMinimumSize(min(720, width), min(520, height))
+            self.resize(min(width, max(720, round(w*fit+36))), min(height, max(520, round(h*fit+190))))
         self._finish = done
         self.show()
         self.canvas.setFocus()
@@ -463,32 +621,65 @@ class ExtractEditor(QDialog):
             self._temporary.cleanup()
 
     def cancel_operation(self):
-        self._operation_epoch += 1
         self._insert_pending = False
-        self._serial += 1
+        self._jobs.clear()
         for worker in tuple(self._workers):
             worker.cancel()
-        self._model_worker,self._preview_worker = None,None
-        self.progress.hide()
-        self.cancel_work.hide()
         if not self._closed:
-            self.status.setText("Operation cancelled; manual tools remain available.")
+            self._status_text = "Operation cancelled; manual tools remain available."
             self.refresh_controls()
 
-    def _track(self,worker):
+    def _begin_job(self, kind, text):
+        job = _ExtractionJob(text, self.state.generation)
+        self._jobs[kind] = job
+        self._operations += 1
+        self._status_text = ""
+        self.refresh_controls()
+        return job
+
+    def _finish_job(self, kind, job):
+        self._operations -= 1
+        if self._jobs.get(kind) is job:
+            del self._jobs[kind]
+            self.refresh_controls()
+
+    def _track(self, kind, job, worker):
+        job.worker = worker
         self._workers.add(worker)
-        worker.progress.connect(lambda x,text:(self.progress.setValue(round(x*100)),self.status.setText(text)))
-        self.progress.show()
-        self.cancel_work.show()
+
+        def progress(fraction, text):
+            if self._jobs.get(kind) is not job:
+                return
+            job.progress = fraction
+            if text:
+                job.text = text
+            self._refresh_work()
+
+        worker.progress.connect(progress)
         future = worker.start()
-        worker.proc.finished.connect(lambda *_:self._workers.discard(worker))
+        worker.proc.finished.connect(lambda *_: self._workers.discard(worker))
         return future
+
+    def _refresh_work(self):
+        job = self._jobs.get("model") or self._jobs.get("preview")
+        text = job.text if job else self._status_text
+        self.status.setText(text)
+        self.work_row.setVisible(bool(text))
+        self.spinner.setVisible(job is not None)
+        self.cancel_work.setVisible(job is not None)
+        self.progress.setVisible(job is not None)
+        if job:
+            if job.progress is None:
+                self.progress.setRange(0, 0)
+            else:
+                self.progress.setRange(0, 100)
+                self.progress.setValue(round(job.progress * 100))
 
     def set_tool(self,tool):
         self.state.tool = tool
-        for button in self.tool_control.buttons():
-            button.setChecked(button.text()==tool.value)
+        self._tool_buttons[tool].setChecked(True)
         self.refresh_controls()
+        self.canvas.refresh_cursor()
         self.canvas.update()
 
     def brush_changed(self,value):
@@ -496,7 +687,7 @@ class ExtractEditor(QDialog):
         self.canvas.update()
 
     def nudge_brush(self,delta):
-        self.brush_slider.setValue(max(3,min(60,self.brush_slider.value()+delta)))
+        self.brush_slider.setValue(self.brush_slider.value() + delta)
 
     def changed(self):
         self._insert_pending = False
@@ -508,23 +699,46 @@ class ExtractEditor(QDialog):
 
     def refresh_controls(self):
         s = self.state
-        self.insert_button.setText(f"Insert {len(s.elements)} Elements" if s.elements else "Insert")
+        count = len(s.elements)
+        noun = "Element" if count == 1 else "Elements"
+        self.insert_button.setText(f"Insert {count} {noun}" if count else "Insert")
         self.insert_button.setEnabled(bool(s.elements))
         self.whole_box.setEnabled(s.selected is not None)
         self.delete_button.setEnabled(s.selected is not None)
         self.clear_button.setEnabled(bool(s.elements))
-        self.brush_slider.setEnabled(s.tool != Tool.box)
+        self._refresh_brush()
         self.preview_box.setEnabled(self.fill_box.isChecked())
-        self.install_button.setVisible(self.extract_runtime is not None and not self.extract_runtime.available)
-        self.install_button.setEnabled(self._model_worker is None)
-        self.detect_button.setEnabled(self.extract_runtime is not None and self._model_worker is None)
-        hints = {Tool.box:"Drag a box; click an element to select it. Shift-drag makes a Whole Box without the model.",
-            Tool.keep:"Paint to include pixels; with no selection, Keep creates an element. Ctrl-click selects another element.",
-            Tool.remove:"Paint to remove pixels from the selected element, or all elements when none is selected."}
-        self.hint.setText(hints[s.tool]+" B / K / R: tools; [ / ]: radius; Delete: remove; Ctrl+Z: undo; Escape: clear selection.")
+        model_present = self.extract_runtime is not None and self.extract_runtime.available
+        model_busy = "model" in self._jobs
+        self.model_row.setVisible(not model_present and not model_busy)
+        self.install_button.setVisible(self.extract_runtime is not None)
+        self.detect_button.setEnabled(model_present and not model_busy)
+        if not model_present:
+            if self.extract_runtime is None:
+                help_text = ("Choose a Python runtime before using the extraction model. "
+                             "Shift-drag a Whole Box, or paint with Keep, without it.")
+            else:
+                help_text = ("The IS-Net model is not downloaded. Box prediction and Find Elements need it. "
+                             "Shift-drag a Whole Box, or paint with Keep, without it.")
+            self.model_help.setText(help_text)
+
+        selected = s.selected
+        if s.tool == Tool.box:
+            hint = ("Drag a box around something to add it. Click an element to select it, Backspace deletes it. "
+                    "Shift-drag cuts out the whole box. B / K / R switch tools, Ctrl+Z undoes.")
+        elif s.tool == Tool.keep:
+            hint = ("Paint over something to make it a new element." if selected is None else
+                    f"Paint over parts element {selected+1} should include. Ctrl-click another element to select it.")
+        else:
+            hint = ("Paint over parts that no element should include." if selected is None else
+                    f"Paint over parts element {selected+1} should leave out (they stay in the picture). "
+                    "Ctrl-click another element to select it.")
+        self.hint.setText(hint)
+        self._refresh_work()
 
     def fill_changed(self,on):
         if not on:
+            self._insert_pending = False
             self.preview_box.setChecked(False)
         self.refresh_controls()
         self.canvas.update()
@@ -540,60 +754,62 @@ class ExtractEditor(QDialog):
         return self.preview_box.isChecked() and s.filled_for == s.generation and s.filled is not None
 
     def compute_preview(self):
-        if self.state.filled_for == self.state.generation:
+        s = self.state
+        if s.filled_for == s.generation:
             self.canvas.update()
             return
-        if self._preview_worker is not None:
-            self._preview_worker.cancel()
-        spawn(self._compute_preview())
+        if (previous := self._jobs.get("preview")) is not None:
+            if previous.generation == s.generation:
+                return
+            del self._jobs["preview"]
+            if previous.worker is not None:
+                previous.worker.cancel()
+        if not s.elements:
+            s.accept_preview(s.generation, None)
+            self._refresh_work()
+            return
+        if not self.runtime:
+            self._insert_pending = False
+            self._status_text = "Choose a Python runtime before computing background fill"
+            self._refresh_work()
+            return
+        job = self._begin_job("preview", "Filling background")
+        spawn(self._compute_preview(job))
 
     def _new_directory(self,label):
         self._serial += 1
         return Path(self._temporary.name)/f"{label}-{self._serial}"
 
-    def _compute_preview(self):
-        if not self.runtime:
-            self.status.setText("Choose a Python runtime before computing background fill")
-            return
-        epoch = self._operation_epoch
+    def _compute_preview(self, job):
         s = self.state
-        generation = s.generation
-        masks = [e.mask.copy() for e in s.elements]
-        if not masks:
-            s.accept_preview(generation,None)
-            return
-        self._operations += 1
+        generation = job.generation
         directory = self._new_directory("fill")
         try:
+            if self._jobs.get("preview") is not job or s.generation != generation:
+                return
+            masks = [e.mask.copy() for e in s.elements]
             image,hole = yield run_blocking(_stage,s.image,masks,directory)
-            if self._closed or s.generation != generation or epoch != self._operation_epoch:
+            if self._jobs.get("preview") is not job or s.generation != generation:
                 return
             worker = WorkerProcess(self.runtime.python,"image_fill",{
                 "image":str(image),"hole":str(hole),"output":str(directory/"filled.png"),"generation":generation,
             },env=self.runtime.child_env())
-            self._preview_worker = worker
-            result = yield self._track(worker)
+            result = yield self._track("preview", job, worker)
             filled = yield run_blocking(ImageExtractor.load,result["output"])
-            if not self._closed and epoch == self._operation_epoch and s.accept_preview(generation,filled):
+            if self._jobs.get("preview") is job and s.accept_preview(generation, filled):
                 self._filled_image = _qimage(filled)
-                self._last_preview_generation = generation
                 self.canvas.update()
-                self.status.setText("Background preview ready")
+                self._status_text = "Background preview ready"
                 if self._insert_pending:
                     self._insert_pending = False
                     self.insert_pressed()
         except Exception as exc:
-            if not self._closed and s.generation == generation:
-                self.status.setText(str(exc))
+            if self._jobs.get("preview") is job and s.generation == generation:
+                self._status_text = str(exc)
                 self._insert_pending = False
         finally:
-            self._operations -= 1
-            self._discard_directory(directory,locals().get("worker"))
-            if self._preview_worker is locals().get("worker"):
-                self._preview_worker = None
-            if self._preview_worker is None:
-                self.progress.hide()
-                self.cancel_work.hide()
+            self._discard_directory(directory, job.worker)
+            self._finish_job("preview", job)
 
     def _discard_directory(self,directory,worker=None):
         from PySide6.QtCore import QProcess
@@ -611,71 +827,69 @@ class ExtractEditor(QDialog):
     def detect_pressed(self):
         self._infer(None)
 
-    def _infer(self,box):
+    def _infer(self, box, *, initial=False):
         if self.extract_runtime is None or not self.extract_runtime.available:
-            self.status.setText("Download the extraction model for Box prediction / Find Elements. Shift-drag a Whole Box, or paint with Keep, without it.")
             return
-        if self._model_worker is None:
-            spawn(self._infer_task(box))
+        if self._closed or "model" in self._jobs:
+            return
+        text = "Finding the subject inside the box" if box else "Finding the separate subjects"
+        job = self._begin_job("model", text)
+        spawn(self._infer_task(box, initial, job))
 
-    def _infer_task(self,box):
-        self._operations += 1
-        epoch = self._operation_epoch
+    def _infer_task(self, box, initial, job):
         directory = self._new_directory("model")
-        generation = self.state.generation
         try:
+            if self._jobs.get("model") is not job:
+                return
             image,_ = yield run_blocking(_stage,self.state.image,[],directory)
-            if self._closed or epoch != self._operation_epoch:
+            if self._jobs.get("model") is not job or job.generation != self.state.generation:
                 return
             xyxy = [box[0],box[1],box[0]+box[2],box[1]+box[3]] if box else None
             worker = self.extract_runtime.inference_worker(image,directory/"masks",xyxy)
-            self._model_worker = worker
-            self.refresh_controls()
-            result = yield self._track(worker)
+            result = yield self._track("model", job, worker)
             masks = yield run_blocking(lambda:[np.asarray(Image.open(p).convert("L")) for p in result["masks"]])
-            if self._closed or epoch != self._operation_epoch or generation != self.state.generation:
+            if self._jobs.get("model") is not job or job.generation != self.state.generation:
                 return
             count = self.state.add_masks(masks,region=box,deduplicate=box is None)
-            self.status.setText(f"Added {count} element{'s' if count != 1 else ''}" if count else "No new separate elements found. Try Whole Box or Keep.")
+            if count and initial:
+                self.state.selected = len(self.state.elements)-count
+                self.canvas.update()
+            self._status_text = (f"Added {count} element{'s' if count != 1 else ''}" if count else
+                                 "No new separate elements found. Try Whole Box or Keep.")
         except Exception as exc:
-            if not self._closed:
-                self.status.setText(str(exc))
+            if self._jobs.get("model") is job:
+                self._status_text = str(exc)
         finally:
-            self._operations -= 1
-            self._discard_directory(directory,locals().get("worker"))
-            if self._model_worker is locals().get("worker"):
-                self._model_worker = None
-                self.progress.hide()
-                self.cancel_work.hide()
-                self.refresh_controls()
+            self._discard_directory(directory, job.worker)
+            self._finish_job("model", job)
 
     def install_model(self):
-        if self.extract_runtime is None or self._model_worker is not None:
+        if self._closed or self.extract_runtime is None or self.extract_runtime.available or "model" in self._jobs:
             return
         answer = QMessageBox.question(self,"Download extraction model",DISCLOSURE,
             QMessageBox.StandardButton.Yes|QMessageBox.StandardButton.Cancel,QMessageBox.StandardButton.Cancel)
-        if answer != QMessageBox.StandardButton.Yes:
+        if answer != QMessageBox.StandardButton.Yes or self._closed:
             return
-        spawn(self._install_model())
+        job = self._begin_job("model", "Downloading the IS-Net model")
+        spawn(self._install_model(job))
 
-    def _install_model(self):
+    def _install_model(self, job):
+        completed = False
         try:
+            if self._jobs.get("model") is not job:
+                return
             worker = self.extract_runtime.install_worker()
-            self._model_worker = worker
-            self.refresh_controls()
-            yield self._track(worker)
+            yield self._track("model", job, worker)
+            completed = self._jobs.get("model") is job
         except Exception as exc:
-            if not self._closed:
-                self.status.setText(str(exc))
-            return
+            if self._jobs.get("model") is job:
+                self._status_text = str(exc)
         finally:
-            self._model_worker = None
-            self.progress.hide()
-            self.cancel_work.hide()
-            self.refresh_controls()
-        if not self._closed:
-            self.status.setText("Model downloaded. Elements may differ from Apple Vision.")
-            self.detect_pressed()
+            self._finish_job("model", job)
+        if completed and not self._closed:
+            self._status_text = "Model downloaded. Elements may differ from Apple Vision."
+            self._refresh_work()
+            QTimer.singleShot(0, self.detect_pressed)
 
     def insert_pressed(self):
         if not self.state.elements:
@@ -694,15 +908,18 @@ class ExtractCanvas(QWidget):
     def __init__(self,editor):
         super().__init__(editor)
         self.editor = editor
-        self.setMouseTracking(True)
-        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.drag_start = self.drag_now = self.last_paint = self.hover = None
         self.painting = False
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMinimumHeight(300)
+        self.setAccessibleName("Extraction canvas")
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
 
     @property
     def picture_rect(self):
         r = QRectF(self.rect()).adjusted(10,10,-10,-10)
-        s = min(r.width()/self.editor.state.w,r.height()/self.editor.state.h)
+        s = max(0, min(r.width()/self.editor.state.w, r.height()/self.editor.state.h))
         w,h = self.editor.state.w*s,self.editor.state.h*s
         return QRectF(r.center().x()-w/2,r.center().y()-h/2,w,h)
 
@@ -712,55 +929,112 @@ class ExtractCanvas(QWidget):
 
     def to_picture(self,p):
         r = self.picture_rect
-        return (p.x()-r.x())/self.scale,(p.y()-r.y())/self.scale
+        scale = r.width()/self.editor.state.w
+        if scale <= 0:
+            return (-1, -1)
+        return (p.x()-r.x())/scale, (p.y()-r.y())/scale
 
     def to_view(self,box):
         r = self.picture_rect
         x0,y0,x1,y1 = box
-        return QRectF(r.x()+x0*self.scale,r.y()+y0*self.scale,(x1-x0)*self.scale,(y1-y0)*self.scale)
+        scale = r.width()/self.editor.state.w
+        return QRectF(r.x()+x0*scale, r.y()+y0*scale, (x1-x0)*scale, (y1-y0)*scale)
 
-    def paintEvent(self,event):
-        e,s = self.editor,self.editor.state
+    def paintEvent(self, event):
+        e, s = self.editor, self.editor.state
         p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+        canvas_clip = QPainterPath()
+        canvas_clip.addRoundedRect(QRectF(self.rect()), 6, 6)
+        p.fillPath(canvas_clip, Theme.canvas_bottom())
+        p.setClipPath(canvas_clip)
+
         r = self.picture_rect
-        p.fillRect(self.rect(),QColor("#292929"))
+        if r.isEmpty():
+            return
+        preview = e.showing_preview
         p.save()
-        p.setClipRect(r)
-        p.fillRect(r,QColor("#525252"))
-        for y in range(math.ceil(r.height()/10)):
-            for x in range(y%2,math.ceil(r.width()/10),2):
-                p.fillRect(QRectF(r.x()+x*10,r.y()+y*10,10,10),QColor("#666666"))
-        p.drawImage(r,e._filled_image if e.showing_preview else e._image)
+        p.setClipRect(r, Qt.ClipOperation.IntersectClip)
+        p.fillRect(r, QColor("#525252"))
+        tile = QColor("#666666")
+        rows, cols = math.ceil(r.height()/10), math.ceil(r.width()/10)
+        for y in range(rows):
+            for x in range(y % 2, cols, 2):
+                p.fillRect(QRectF(r.x()+x*10, r.y()+y*10, 10, 10), tile)
+        p.drawImage(r, e._filled_image if preview else e._image)
         p.restore()
-        for i,element in enumerate(s.elements):
-            color = QColor(e.colors[element.color%len(e.colors)])
-            if not e.showing_preview:
+
+        p.setFont(Theme.font(11, QFont.Weight.Bold))
+        metrics = p.fontMetrics()
+        for i, element in enumerate(s.elements):
+            color = QColor(e.colors[element.color % len(e.colors)])
+            selected = s.selected == i
+            if not preview:
                 if i not in e._overlays:
                     rgba = np.empty((s.h,s.w,4),np.uint8)
                     rgba[:,:,:3] = color.red(),color.green(),color.blue()
                     rgba[:,:,3] = (element.mask.astype(np.uint16)*140//255).astype(np.uint8)
                     e._overlays[i] = QImage(rgba.data,s.w,s.h,rgba.strides[0],QImage.Format.Format_RGBA8888).copy()
-                p.setOpacity(1 if s.selected==i else 0.55)
-                p.drawImage(r,e._overlays[i])
+                p.setOpacity(1 if selected else 0.55)
+                p.drawImage(r, e._overlays[i])
                 p.setOpacity(1)
             if element.bounds:
-                box = self.to_view(element.bounds).adjusted(-1,-1,1,1)
-                p.setPen(QPen(color,2 if s.selected==i else 1,Qt.PenStyle.SolidLine if s.selected==i else Qt.PenStyle.DashLine))
+                box = self.to_view(element.bounds).adjusted(-1, -1, 1, 1)
+                edge = QColor(color)
+                edge.setAlphaF(1 if selected else 0.8)
+                pen = QPen(edge, 2 if selected else 1)
+                if not selected:
+                    pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+                    pen.setDashPattern([5, 3])
+                p.setPen(pen)
+                p.setBrush(Qt.BrushStyle.NoBrush)
                 p.drawRect(box)
-                badge = QRectF(box.x(),box.y(),24,18)
-                p.fillRect(badge,color)
+
+                label = str(i+1)
+                badge = QRectF(box.x(), box.y(), metrics.horizontalAdvance(label)+10, metrics.height()+2)
+                p.setPen(Qt.PenStyle.NoPen)
+                p.setBrush(color)
+                p.drawRoundedRect(badge, 4, 4)
                 p.setPen(Qt.GlobalColor.white)
-                p.drawText(badge,Qt.AlignmentFlag.AlignCenter,str(i+1))
-        if self.drag_start is not None and not self.painting:
-            p.setPen(QPen(Qt.GlobalColor.white,1.5,Qt.PenStyle.DashLine))
-            p.drawRect(QRectF(self.drag_start,self.drag_now).normalized())
-        if self.hover is not None and s.tool!=Tool.box:
-            p.setPen(QPen(QColor("#33CC55" if s.tool==Tool.keep else "#FF5555"),1.5))
-            p.drawEllipse(self.hover,s.brush,s.brush)
+                p.drawText(badge, Qt.AlignmentFlag.AlignCenter, label)
+
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        if s.tool == Tool.box and self.drag_start is not None and not self.painting:
+            box = QRectF(self.drag_start, self.drag_now).normalized()
+            p.fillRect(box, QColor.fromRgbF(1, 1, 1, 0.08))
+            pen = QPen(Qt.GlobalColor.white, 1.5)
+            pen.setCapStyle(Qt.PenCapStyle.FlatCap)
+            pen.setDashPattern([6/1.5, 4/1.5])  # Qt expresses dash lengths in pen widths.
+            p.setPen(pen)
+            p.drawRect(box)
+        elif self.hover is not None and s.tool != Tool.box:
+            dark = is_dark()
+            if s.tool == Tool.keep:
+                color = QColor("#30d158" if dark else "#34c759")
+            else:
+                color = QColor("#ff453a" if dark else "#ff3b30")
+            p.setPen(QPen(color, 1.5))
+            p.drawEllipse(self.hover, s.brush, s.brush)
+
+    def refresh_cursor(self):
+        crosshair = (self.editor.state.tool == Tool.box and self.hover is not None
+                     and self.picture_rect.contains(self.hover))
+        shape = Qt.CursorShape.CrossCursor if crosshair else Qt.CursorShape.ArrowCursor
+        if self.cursor().shape() != shape:
+            self.setCursor(shape)
+
+    def enterEvent(self, event):
+        self.hover = event.position()
+        self.refresh_cursor()
+        self.update()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self.refresh_cursor()
 
     def mousePressEvent(self,event):
-        if event.button()!=Qt.MouseButton.LeftButton or not self.picture_rect.contains(event.position()):
+        if event.button() != Qt.MouseButton.LeftButton or self.picture_rect.isEmpty():
             return
         self.setFocus()
         s = self.editor.state
@@ -776,10 +1050,12 @@ class ExtractCanvas(QWidget):
             self.last_paint = self.to_picture(p)
             s.paint(self.last_paint,self.last_paint,s.brush/self.scale)
             self.editor._overlays.clear()
+            self.editor.refresh_controls()
         self.update()
 
     def mouseMoveEvent(self,event):
         self.hover = event.position()
+        self.refresh_cursor()
         if self.drag_start is not None:
             self.drag_now = self.hover
             if self.painting:
@@ -791,7 +1067,7 @@ class ExtractCanvas(QWidget):
         self.update()
 
     def mouseReleaseEvent(self,event):
-        if self.drag_start is None:
+        if event.button() != Qt.MouseButton.LeftButton or self.drag_start is None:
             return
         a,b = self.drag_start,event.position()
         self.drag_start = self.drag_now = None
@@ -813,13 +1089,17 @@ class ExtractCanvas(QWidget):
 
     def leaveEvent(self,event):
         self.hover = None
+        self.refresh_cursor()
         self.update()
 
     def keyPressEvent(self,event):
         s = self.editor.state
-        if event.key() in (Qt.Key.Key_Delete,Qt.Key.Key_Backspace):
-            s.delete_selected()
-        elif event.key()==Qt.Key.Key_Escape:
+        if event.key() in (Qt.Key.Key_Delete, Qt.Key.Key_Backspace):
+            if s.selected is None:
+                QApplication.beep()
+            else:
+                s.delete_selected()
+        elif event.key() == Qt.Key.Key_Escape and s.selected is not None:
             s.selected = None
             self.editor.refresh_controls()
         elif event.text().lower() in ("b","k","r"):
@@ -828,6 +1108,7 @@ class ExtractCanvas(QWidget):
             self.editor.nudge_brush(-3 if event.text()=="[" else 3)
         else:
             super().keyPressEvent(event)
+            return
         self.update()
 
 
@@ -854,15 +1135,25 @@ class ExtractMixin:
         first_shown = next((i for i,s in enumerate(stops) if any(int(v[0])==oid for v in s.get("visible",[]))),stop)
         try:
             yield from self.finish_edits()
-            image = yield run_blocking(ImageExtractor.load,path)
-            model = ExtractRuntime(self.paths,self.runtime)
+            model = ExtractRuntime(self.paths, self.runtime)
+            source = o.get("image") or "the picture"
+            loading = f"Finding the elements of {source}…" if model.available else f"Loading {source}…"
+            self.busy_pill.show(loading, spinning=True, cancellable=False)
+            try:
+                image = yield run_blocking(ImageExtractor.load, path)
+            except Exception as exc:
+                self.alert("Could not analyse the picture", str(exc))
+                return
+            finally:
+                self.update_busy_pill()
             if interactive:
-                editor = ExtractEditor(image,source=o.get("image","the picture"),runtime=self.runtime,extract_runtime=model,parent=self.window)
+                editor = ExtractEditor(image, source=source, runtime=self.runtime,
+                                       extract_runtime=model, parent=self.window)
                 self._extract_editor = editor
                 future = Future()
                 editor.run(done=future.set_result)
                 if model.available:
-                    QTimer.singleShot(0,editor.detect_pressed)
+                    QTimer.singleShot(0, lambda: editor._infer(None, initial=True))
                 choice = yield future
             else:
                 # Noninteractive callers must explicitly request model inference;
@@ -876,34 +1167,59 @@ class ExtractMixin:
                     result = yield worker.start()
                     masks = yield run_blocking(lambda:[np.asarray(Image.open(p).convert("L")) for p in result["masks"]])
                 if not masks:
-                    raise ValueError("No separate elements found; use Whole Box or Keep")
+                    self.toast("No separate elements were found in this picture", error=True)
+                    return
                 choice = ExtractEditor.Result(masks,True,None)
             if choice is None or self.work_deck!=deck or self.scene_name!=name:
                 return
-            filled = choice.filled
-            if choice.fill and filled is None:
-                with tempfile.TemporaryDirectory(prefix="manimble-extract-fill-") as directory:
-                    image_file,hole_file = yield run_blocking(_stage,image,choice.masks,directory)
-                    worker = WorkerProcess(self.runtime.python,"image_fill",{
-                        "image":str(image_file),"hole":str(hole_file),"output":str(Path(directory)/"filled.png"),
-                    },env=self.runtime.child_env())
-                    # Retain the cancellable process on the controller until it finishes.
-                    self._extract_worker = worker
-                    result = yield worker.start()
-                    filled = yield run_blocking(ImageExtractor.load,result["output"])
-            if self.work_deck!=deck or self.scene_name!=name:
+            cutting = ("Cutting out the elements and filling in the background…" if choice.fill else
+                       "Cutting out the elements…")
+            self.busy_pill.show(cutting, spinning=True, cancellable=False)
+            try:
+                filled = choice.filled
+                if choice.fill and filled is None:
+                    try:
+                        with tempfile.TemporaryDirectory(prefix="manimble-extract-fill-") as directory:
+                            image_file, hole_file = yield run_blocking(_stage, image, choice.masks, directory)
+                            worker = WorkerProcess(self.runtime.python, "image_fill", {
+                                "image": str(image_file), "hole": str(hole_file), "output": str(Path(directory)/"filled.png"),
+                            }, env=self.runtime.child_env())
+                            self._extract_worker = worker
+                            result = yield worker.start()
+                            filled = yield run_blocking(ImageExtractor.load, result["output"])
+                    except Exception as exc:
+                        self.alert("Could not fill in the background", str(exc))
+                        return
+                if self.work_deck != deck or self.scene_name != name:
+                    return
+                parts, background = yield run_blocking(save_parts, image, choice.masks, deck,
+                                                       Path(path).stem, filled if choice.fill else None)
+            except _NothingToExtract:
+                self.toast("Nothing to extract", error=True)
                 return
-            parts,background = yield run_blocking(save_parts,image,choice.masks,deck,Path(path).stem,filled if choice.fill else None)
+            except _SaveExtractionError as exc:
+                self.alert(f"Could not save {exc.filename}", str(exc))
+                return
+            finally:
+                self.update_busy_pill()
             request = build_insert_request(name,stop,first_shown,oid,box,image.size,parts,background,context.seen)
             def commit():
                 if self.work_deck!=deck:
                     return
-                reply = yield self.call("insert_many",request)
+                self.busy += 1
+                try:
+                    reply = yield self.call("insert_many", request)
+                finally:
+                    self.busy -= 1
                 if reply.get("ok") is False:
-                    raise RuntimeError(reply.get("error","Could not insert extracted elements"))
+                    self.toast(reply.get("error") or "could not insert the elements", error=True)
+                    return
                 yield from self.load_scene(name,keep_stop=True)
                 yield from self.reload_state()
-                self.toast(f"Inserted {len(parts)} elements"+(" and filled the background" if background else "")+" · Ctrl+Z undoes it all")
+                count = len(parts)
+                what = f"{count} element{'s' if count != 1 else ''}"
+                self.toast(f"Inserted {what} and filled in the picture behind them · Ctrl+Z undoes it all"
+                           if background else f"Inserted {what} from the picture · Ctrl+Z undoes them all")
             yield self.submit(commit)
         except Exception as exc:
             self.alert("Could not extract elements",str(exc))

@@ -1,6 +1,7 @@
 """Qt-independent portable project creation, opening, new-deck files and recents."""
 from __future__ import annotations
 
+from contextlib import suppress
 from datetime import datetime, timezone
 import hashlib
 import json
@@ -13,6 +14,8 @@ import tempfile
 import uuid
 import zipfile
 
+from .fonts import deck_font_env
+from .paths import AppPaths
 from .workspace import atomic_copy
 
 MANIFEST_NAME = "manimble-project.json"
@@ -57,7 +60,7 @@ def resolve_project(path):
         return deck_url(path) or path
     if path.suffix.lower() == ".py" or (path.parent / "order.txt").is_file():
         return path.parent
-    raise PortableProjectError("Choose a deck folder, Python file, project folder or .manimble archive")
+    raise PortableProjectError("Choose a deck folder or a .manimble package.")
 
 
 def unpack_archive(archive, target, runtime):
@@ -244,7 +247,7 @@ class PortableProject:
         return destination
 
 
-def new_deck_files(title, theme=None):
+def new_deck_files(title, theme=None, *, paths=None):
     common = '''"""Shared base class for the deck."""
 from pathlib import Path
 from manim import *
@@ -257,9 +260,12 @@ class Deck(Slide):
 '''
     metadata = {}
     if theme:
-        # The engine parser reads constants via AST; theme source is never executed here.
-        from manimble.theme import load
-        metadata = load(theme) if isinstance(theme, str) else dict(theme)
+        if isinstance(theme, str):
+            # The engine parser reads constants via AST; theme source is never executed here.
+            from manimble.theme import load
+            metadata = load(theme, env=deck_font_env(paths or AppPaths.from_environment()))
+        else:
+            metadata = dict(theme)
         constants = "\n".join(f"{key} = {json.dumps(metadata[key], ensure_ascii=False)}" for key in
                               ("THEME", "BACKGROUND", "FONT", "TEXT_COLOR", "MUTED_COLOR", "ACCENT") if key in metadata)
         common = constants + "\n\n" + common
@@ -279,25 +285,38 @@ class Title(Deck):
             "manim.cfg": f"[CLI]\nbackground_color = {metadata.get('BACKGROUND', '#000000')}\npixel_width = 1280\npixel_height = 720\nframe_rate = 30\n"}
 
 
-def create_new_deck(destination, title=None, theme=None):
+def create_new_deck(destination, title=None, theme=None, *, paths=None):
     destination = Path(destination).absolute()
     deck = destination / "deck"
     if os.path.lexists(deck):
-        raise FileExistsError(f"A deck already exists at {deck}")
-    files = new_deck_files(title or destination.name, theme)
-    made_project = not destination.exists()
-    made_assets = not (destination / "assets").exists()
-    deck.mkdir(parents=True)
+        raise FileExistsError(
+            f"{destination.name} already holds a deck. Open it with File ▸ Open Deck or Project…, or choose another name.")
+    files = new_deck_files(title or destination.name, theme, paths=paths)
+    assets = destination / "assets"
+    made_project = made_deck = made_assets = False
+    created_files = []
     try:
-        (destination / "assets").mkdir(exist_ok=True)
+        if not destination.exists():
+            destination.mkdir(parents=True)
+            made_project = True
+        deck.mkdir()
+        made_deck = True
+        if not assets.is_dir():
+            assets.mkdir()
+            made_assets = True
         for name, text in files.items():
-            (deck / name).write_text(text, encoding="utf-8")
+            file = deck / name
+            with file.open("x", encoding="utf-8") as stream:
+                created_files.append(file)
+                stream.write(text)
     except BaseException:
-        shutil.rmtree(deck)
-        if made_assets:
-            (destination / "assets").rmdir()
-        if made_project:
-            destination.rmdir()
+        for file in created_files:
+            with suppress(OSError):
+                file.unlink()
+        for folder, created in ((deck, made_deck), (assets, made_assets), (destination, made_project)):
+            if created:
+                with suppress(OSError):
+                    folder.rmdir()
         raise
     return deck
 
@@ -363,14 +382,20 @@ def selected_movie_scenes(scenes, text):
             else:
                 unknown.append(token)
         else:
-            index = next((i for i, scene in enumerate(scenes) if scene["name"].lower() == token.lower()), None)
+            index = next((i for i, scene in enumerate(scenes) if scene["name"] == token), None)
+            if index is None:
+                index = next((i for i, scene in enumerate(scenes) if scene["name"].casefold() == token.casefold()), None)
             if index is None:
                 unknown.append(token)
             else:
                 picked.add(index)
     if unknown:
-        raise ValueError("No such slides: " + ", ".join(unknown) + f". Use navigator numbers (1–{len(scenes)}), names or ranges.")
+        raise ValueError(
+            "No such slides: " + ", ".join(unknown) +
+            f"\n\nType the navigator’s numbers (1–{len(scenes)}), ranges like 2-5, or slide names, separated by commas.")
     names = [scenes[i]["name"] for i in sorted(picked) if not scenes[i].get("hidden")]
     if not names:
-        raise ValueError("Only hidden slides were chosen." if picked else "Type which slides to export, for example 1-3, 7 or Summary.")
+        if picked:
+            raise ValueError("Only hidden slides were chosen.\n\nHidden slides are left out of exports; unhide them or choose others.")
+        raise ValueError("Type which slides to export.\n\nFor example 1-3, 7 or Summary.")
     return names

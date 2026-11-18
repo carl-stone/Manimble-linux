@@ -1,5 +1,6 @@
 """Qt-independent checks for the shared engine's platform boundaries."""
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -10,7 +11,7 @@ from unittest.mock import patch
 
 from manimble import beamer_import, export, importer, latex_packages, theme
 from manimble.core import Manimble
-from manimble.srcedit import wrap_soft
+from manimble.srcedit import Project, wrap_soft
 
 
 LINUX = sys.platform.startswith("linux")
@@ -21,24 +22,26 @@ class EngineGuardsTest(unittest.TestCase):
         self.assertIsNone(importer._font("Manimble Definitely Missing Font 973821", False, False))
 
     def test_fontconfig_match_caches_file_and_face_index(self):
-        importer._fontconfig_match.cache_clear()
-        self.addCleanup(importer._fontconfig_match.cache_clear)
-        reply = SimpleNamespace(returncode=0, stdout="Requested Font,Alias\n/fonts/collection.ttc\n3\n", stderr="")
+        importer._matched_fontconfig_face.cache_clear()
+        self.addCleanup(importer._matched_fontconfig_face.cache_clear)
+        reply = SimpleNamespace(returncode=0, stdout=f"Requested Font,Alias\n{__file__}\n3\n", stderr="")
         with patch.object(importer.subprocess, "run", return_value=reply) as run:
             for _ in range(2):
-                self.assertEqual(importer._fontconfig_match("Requested Font", True, True, False),
-                                 ("/fonts/collection.ttc", 3))
+                match = importer._fontconfig_match("Requested Font", True, True, False)
+                self.assertEqual(match.families, ("Requested Font", "Alias"))
+                self.assertEqual((match.file, match.index), (__file__, 3))
             self.assertEqual(run.call_count, 1)
             args = run.call_args.args[0]
             self.assertEqual(args[0], "fc-match")
             self.assertIn(":weight=bold:slant=italic", args[-1])
             self.assertIsNone(importer._fontconfig_match("Absent Font", False, False, False))
-            self.assertEqual(importer._fontconfig_match("Absent Font", False, False, True),
-                             ("/fonts/collection.ttc", 3))
+            match = importer._fontconfig_match("Absent Font", False, False, True)
+            self.assertEqual((match.file, match.index), (__file__, 3))
+            self.assertEqual(run.call_count, 2)  # exact and substituted lookups share the reported face
 
     def test_missing_fontconfig_has_dependency_diagnostic(self):
-        importer._fontconfig_match.cache_clear()
-        self.addCleanup(importer._fontconfig_match.cache_clear)
+        importer._matched_fontconfig_face.cache_clear()
+        self.addCleanup(importer._matched_fontconfig_face.cache_clear)
         with patch.object(importer.subprocess, "run", side_effect=FileNotFoundError):
             with self.assertRaisesRegex(RuntimeError, "fc-match.*fontconfig"):
                 importer._fontconfig_match("Missing tool test", False, False, True)
@@ -53,20 +56,17 @@ class EngineGuardsTest(unittest.TestCase):
             config = Path(tmp) / "fonts.conf"
             config.write_text("<fontconfig><dir>" + escape(str(fonts)) + "</dir><cachedir>" +
                               escape(tmp) + "</cachedir></fontconfig>", encoding="utf-8")
-            importer._font_cache.clear()
-            importer._fontconfig_match.cache_clear()
-            self.addCleanup(importer._font_cache.clear)
-            self.addCleanup(importer._fontconfig_match.cache_clear)
             with patch.dict("os.environ", {"FONTCONFIG_FILE": str(config)}):
                 self.assertEqual(importer.DEFAULT_FONT, "DejaVu Sans")
-                for bold, italic in ((False, False), (True, False), (False, True), (True, True)):
+                for stem, bold, italic in (("DejaVuSans", False, False), ("DejaVuSans-Bold", True, False),
+                                           ("DejaVuSans-Oblique", False, True), ("DejaVuSans-BoldOblique", True, True)):
                     face = importer._font_or_fallback("DejaVu Sans", bold, italic)
-                    self.assertIn("DejaVu Sans", face.getname()[0])
+                    self.assertEqual(Path(face.path).stem, stem)
                 missing = "Manimble Definitely Missing Font 973821"
                 face = importer._font_or_fallback(missing, False, False)
                 self.assertIsNotNone(face)
                 match = importer._fontconfig_match(missing, False, False, True)
-                self.assertEqual(Path(face.path), Path(match[0]))
+                self.assertEqual((face.path, face.index), (match.file, match.index))
                 self.assertIsNone(importer._font(missing, False, False))
 
     @unittest.skipUnless(LINUX, "Linux wrap measurement must follow Fontconfig substitution")
@@ -83,22 +83,72 @@ class EngineGuardsTest(unittest.TestCase):
 
     @unittest.skipUnless(LINUX, "Linux substitutes unavailable bundled Mac theme fonts")
     def test_theme_substitution_preserves_files_and_installed_original(self):
-        expected = {"midnight": "DejaVu Sans", "paper": "DejaVu Sans", "slate": "DejaVu Sans",
-                    "ember": "DejaVu Sans", "chalkboard": "DejaVu Sans", "parchment": "DejaVu Serif",
+        import matplotlib
+        from xml.sax.saxutils import escape
+
+        resources = Path(__file__).resolve().parents[1] / "resources" / "fonts"
+        dejavu = Path(matplotlib.get_data_path()) / "fonts" / "ttf"
+        expected = {"midnight": "DejaVu Sans", "paper": "DejaVu Sans", "slate": "Nunito Sans",
+                    "ember": "DejaVu Sans", "chalkboard": "Comic Neue", "parchment": "DejaVu Serif",
                     "terminal": "DejaVu Sans Mono"}
-        for name, fallback in expected.items():
-            path = Path(theme.DIR) / (name + ".py")
-            original = path.read_bytes()
-            with self.subTest(theme=name), patch.object(importer, "_font", return_value=None):
-                self.assertEqual(theme.load(name)["FONT"], fallback)
-            self.assertEqual(path.read_bytes(), original)
-        with patch.object(importer, "_font", return_value=object()):
-            self.assertEqual(theme.load("terminal")["FONT"], "Menlo")
-            self.assertEqual(theme.load("parchment")["FONT"], "Palatino")
+        with tempfile.TemporaryDirectory(prefix="manimble fonts & ") as tmp:
+            root = Path(tmp)
+
+            def config(name, rules):
+                path = root / (name + ".conf")
+                path.write_text(f"<fontconfig><cachedir>{escape(str(root / name))}</cachedir>{rules}</fontconfig>",
+                                encoding="utf-8")
+                return {**os.environ, "FONTCONFIG_FILE": str(path)}
+
+            dirs = (dejavu, resources / "comicneue", resources / "nunitosans")
+            rules = "".join(f"<dir>{escape(str(directory))}</dir>" for directory in dirs)
+            rules += f"<include>{escape(str(resources / 'theme-aliases.conf'))}</include>"
+            absent = config("absent", rules)
+            # Append the Mac name to a real face's reported family list without using any Apple font bytes.
+            installed = config("installed", rules + """
+                <match target="scan">
+                  <test name="family"><string>Comic Neue</string></test>
+                  <edit name="family" mode="append" binding="strong"><string>Chalkboard SE</string></edit>
+                </match>""")
+            empty = config("empty", "<reset-dirs/>")
+
+            for name, fallback in expected.items():
+                with self.subTest(theme=name):
+                    path = Path(theme.DIR) / (name + ".py")
+                    original = path.read_bytes()
+                    self.assertEqual(theme.load(name, env=absent)["FONT"], fallback)
+                    self.assertEqual(path.read_bytes(), original)
+
+            source = b'THEME = "Chalkboard"\nFONT = "Chalkboard SE"\nOTHER_FONT = "DejaVu Sans"\n'
+            common = root / "common.py"
+            common.write_bytes(source)
+            deck = SimpleNamespace(deck=tmp, project=Project(tmp))
+            with patch.dict(os.environ, {"FONTCONFIG_FILE": absent["FONTCONFIG_FILE"]}):
+                self.assertEqual(theme.load("chalkboard", env=installed)["FONT"], "Chalkboard SE")
+                self.assertEqual(importer.resolve_font_family("chalkboard se", env=installed), "chalkboard se")
+                self.assertEqual(theme.load("chalkboard", env=empty)["FONT"], "Chalkboard SE")
+                self.assertEqual(os.environ["FONTCONFIG_FILE"], absent["FONTCONFIG_FILE"])
+                self.assertEqual(theme.load("chalkboard")["FONT"], "Comic Neue")
+                self.assertEqual(theme.apply(deck, {"op": "get", "theme": "chalkboard"})["theme"], "Chalkboard")
+
+                family = "Chalkboard SE"
+                self.assertIsNone(importer._font(family, True, True))
+                comic = importer._font_or_fallback(family, True, True)
+                self.assertEqual(Path(comic.path).name, "ComicNeue-BoldItalic.ttf")
+                self.assertEqual(importer.resolve_font_family("DejaVu Sans"), "DejaVu Sans")
+
+                nunito = importer._font_or_fallback("Avenir Next", True, True)
+                match = importer._fontconfig_match("Avenir Next", True, True, True)
+                self.assertEqual((nunito.path, nunito.index), (match.file, match.index))
+                self.assertEqual(nunito.getname(), ("Nunito Sans", "Bold Italic"))
+
+            with patch.dict(os.environ, {"FONTCONFIG_FILE": installed["FONTCONFIG_FILE"]}):
+                self.assertEqual(importer._font(family, True, True).path, comic.path)
+            self.assertEqual(common.read_bytes(), source)
 
     @unittest.skipUnless(sys.platform == "darwin", "Darwin keeps bundled theme font names")
     def test_darwin_theme_fonts_are_unchanged(self):
-        with patch.object(importer, "_font", side_effect=AssertionError("Linux-only lookup")):
+        with patch.object(importer, "resolve_font_family", side_effect=AssertionError("Linux-only lookup")):
             self.assertEqual(theme.load("terminal")["FONT"], "Menlo")
             self.assertEqual(theme.load("parchment")["FONT"], "Palatino")
 
@@ -175,9 +225,15 @@ class EngineGuardsTest(unittest.TestCase):
 
     def test_build_media_slot_zero_preserves_platform_contract(self):
         obj = SimpleNamespace(cache_dir=Path("/private/cache"))
-        expected = "/private/cache/media/build-0" if LINUX else "../media"
-        self.assertEqual(Manimble._build_media(obj, 0), expected)
-        self.assertEqual(Manimble._build_media(obj, 1), "/private/cache/media/build-1")
+        slot0 = Manimble._build_media(obj, 0)
+        slot1 = Path(Manimble._build_media(obj, 1))
+        self.assertEqual(slot1.name, "build-1")
+        if LINUX:
+            self.assertEqual(Path(slot0), slot1.parent / "build-0")
+            self.assertEqual(slot1.parent.parent, obj.cache_dir / "media")
+        else:
+            self.assertEqual(slot0, "../media")
+            self.assertEqual(slot1.parent, obj.cache_dir / "media")
 
 
 class ProjectFormatPortabilityTest(unittest.TestCase):

@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from . import paths as _paths
+from .fonts import deck_font_env
 from .paths import AppPaths
 
 SUPPORTED = ((3, 11), (3, 14))         # inclusive
@@ -121,7 +122,7 @@ class Runtime:
         env = self.child_env(base)
         env["PYTHONPATH"] = str(self.engine)
         env["PYTHONUNBUFFERED"] = "1"
-        return env
+        return deck_font_env(self.paths, env)
 
     def engine_command(self) -> list[str]:
         return [self.python, "-u", "-m", "manimble.rpc"]

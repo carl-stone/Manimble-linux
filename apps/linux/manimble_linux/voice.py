@@ -6,6 +6,7 @@ Secret Service backend is selected explicitly rather than keyring's fallback cha
 from __future__ import annotations
 
 from concurrent.futures import Future
+from contextlib import closing
 from enum import Enum
 import hashlib
 import json
@@ -19,6 +20,8 @@ import time
 from urllib.error import HTTPError
 from urllib.parse import quote
 from urllib.request import Request, urlopen
+
+_KEYRING_SERVICE = "org.pachterlab.Manimble.voice"
 
 
 class VoiceError(RuntimeError):
@@ -90,7 +93,7 @@ class CloudVoiceService(str, Enum):
     @property
     def api_key(self):
         try:
-            return secret_backend().get_password("org.pachterlab.Manimble.voice", self.value)
+            return secret_backend().get_password(_KEYRING_SERVICE, self.value)
         except VoiceError:
             raise
         except Exception as exc:
@@ -100,13 +103,37 @@ class CloudVoiceService(str, Enum):
     def connected(self):
         return bool(self.api_key)
 
+    def _saved_key_exists(self):
+        try:
+            from secretstorage import Collection, dbus_init
+            from secretstorage.exceptions import ItemNotFoundException
+
+            # Keyring unlocks the default collection to get a password.
+            # Query item attributes without reading keys or creating the collection.
+            with closing(dbus_init()) as bus:
+                try:
+                    items = Collection(bus).search_items({"service": _KEYRING_SERVICE, "username": self.value})
+                    return next(items, None) is not None
+                except ItemNotFoundException:
+                    return False
+        except Exception as exc:
+            raise VoiceError(f"Cannot read the Secret Service keyring: {exc}") from exc
+
+    @property
+    def has_saved_key(self):
+        """Passive account status, including locked saved items."""
+        try:
+            return self._saved_key_exists()
+        except VoiceError:
+            return False
+
     def set_key(self, key):
         try:
             backend = secret_backend()
             if key:
-                backend.set_password("org.pachterlab.Manimble.voice", self.value, key)
-            elif backend.get_password("org.pachterlab.Manimble.voice", self.value) is not None:
-                backend.delete_password("org.pachterlab.Manimble.voice", self.value)
+                backend.set_password(_KEYRING_SERVICE, self.value, key)
+            elif backend.get_password(_KEYRING_SERVICE, self.value) is not None:
+                backend.delete_password(_KEYRING_SERVICE, self.value)
         except VoiceError:
             raise
         except Exception as exc:
@@ -119,7 +146,9 @@ class CloudVoiceService(str, Enum):
         key = self.api_key
         if not key:
             raise VoiceError(f"{self.name} is not connected.")
-        data = self._list(key, base_url=base_url)
+        return self._voice_choices(self._list(key, base_url=base_url))
+
+    def _voice_choices(self, data):
         if self is self.openai:
             return self.builtin_voices
         return sorted([(v["voice_id"], v["name"]) for v in data["voices"]], key=lambda v: v[1])
@@ -362,20 +391,104 @@ class VoiceManager:
 class CloudVoiceAccount:
     @staticmethod
     def connect(service, parent=None):
-        from PySide6.QtWidgets import QInputDialog, QLineEdit, QMessageBox
+        from PySide6.QtCore import Qt, QUrl
+        from PySide6.QtGui import QDesktopServices, QFont
+        from PySide6.QtWidgets import (QDialog, QDialogButtonBox, QLabel, QLineEdit, QMessageBox,
+                                       QToolButton, QVBoxLayout)
+        from .style import Theme
+        from .widgets import add_copy_button
         from .workers import run_blocking
+
         service = CloudVoiceService(service)
-        key, ok = QInputDialog.getText(parent, f"Connect {service.name}",
-            f"API key ({service.key_page}). Stored only in the Secret Service keyring.\nLeave empty to disconnect.",
-            QLineEdit.EchoMode.Password)
-        if not ok:
+        blocked = None
+        try:
+            connected = yield run_blocking(service._saved_key_exists)
+        except VoiceError as exc:
+            connected, blocked = False, str(exc)
+
+        title = f"{service.name} is connected" if connected else f"Connect {service.name}"
+        dialog = QDialog(parent)
+        dialog.setWindowTitle(title)
+        layout = QVBoxLayout(dialog)
+        heading = QLabel(title)
+        heading.setFont(Theme.font(14, QFont.Weight.DemiBold))
+        layout.addWidget(heading)
+        description = QLabel(
+            f"Paste an API key from your {service.name} account. It is kept in your Secret Service keyring, "
+            f"and the words of the script are sent to {service.name} to be spoken (billed to that account). "
+            "Speech is cached, so a show replays without calling it again.")
+        description.setWordWrap(True)
+        description.setMinimumWidth(360)
+        layout.addWidget(description)
+        field = QLineEdit()
+        field.setEchoMode(QLineEdit.EchoMode.Password)
+        field.setPlaceholderText("Paste a new key to replace it" if connected else "API key")
+        field.setEnabled(blocked is None)
+        layout.addWidget(field)
+        page = QUrl(service.key_page)
+        link = QToolButton()
+        link.setAutoRaise(True)
+        link.setText(f"Get a key at {page.host()}…")
+        link_font = Theme.font(11)
+        link_font.setUnderline(True)
+        link.setFont(link_font)
+        link.clicked.connect(lambda: QDesktopServices.openUrl(page))
+        layout.addWidget(link, 0, Qt.AlignmentFlag.AlignLeft)
+        if blocked:
+            label = QLabel(blocked)
+            label.setTextFormat(Qt.TextFormat.PlainText)
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            layout.addWidget(label)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel)
+        connect = buttons.addButton("Connect", QDialogButtonBox.ButtonRole.AcceptRole)
+        connect.setEnabled(False)
+        field.textChanged.connect(lambda key: connect.setEnabled(blocked is None and bool(key.strip())))
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        disconnect = False
+        if connected:
+            def remove_key():
+                nonlocal disconnect
+                disconnect = True
+                dialog.accept()
+            buttons.addButton("Disconnect", QDialogButtonBox.ButtonRole.DestructiveRole).clicked.connect(remove_key)
+        layout.addWidget(buttons)
+        field.setFocus()
+        if dialog.exec() != QDialog.DialogCode.Accepted:
             return None
-        if not key:
+        if disconnect:
             answer = QMessageBox.question(parent, "Disconnect account", f"Remove the saved {service.name} key?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel, QMessageBox.StandardButton.Cancel)
             if answer != QMessageBox.StandardButton.Yes:
                 return None
-        if key:
-            yield run_blocking(service.verify, key)
-        yield run_blocking(service.set_key, key.strip() or None)
-        return (yield run_blocking(service.refresh_voices)) if key else service.builtin_voices
+            yield run_blocking(service.set_key, None)
+            return service.builtin_voices
+
+        key = field.text().strip()
+        field.clear()
+        if not key or blocked:
+            return None
+        host = "api.elevenlabs.io" if service is CloudVoiceService.elevenlabs else "api.openai.com"
+        confirm = QMessageBox(QMessageBox.Icon.Question, "Verify API key",
+                             f"Verify this key with {service.name} ({host})? No script text is sent.",
+                             QMessageBox.StandardButton.Cancel, parent)
+        verify = confirm.addButton("Verify and Connect", QMessageBox.ButtonRole.AcceptRole)
+        confirm.setDefaultButton(QMessageBox.StandardButton.Cancel)
+        confirm.exec()
+        if confirm.clickedButton() is not verify:
+            return None
+        try:
+            data = yield run_blocking(service.verify, key)
+            voices = service._voice_choices(data)
+        except (VoiceError, ValueError, KeyError, TypeError) as exc:
+            title = f"{service.name} did not accept the key"
+            error = QMessageBox(QMessageBox.Icon.Warning, title, title, QMessageBox.StandardButton.Ok, parent)
+            error.setTextFormat(Qt.TextFormat.PlainText)
+            error.setInformativeText(str(exc).replace(key, "[redacted]"))
+            add_copy_button(error)
+            error.exec()
+            return None
+        yield run_blocking(service.set_key, key)
+        return voices

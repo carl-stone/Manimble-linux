@@ -7,8 +7,9 @@ import tempfile
 import time
 import unittest
 
-from PySide6.QtCore import QSettings
-from PySide6.QtTest import QTest
+from PySide6.QtCore import QSettings, Qt, QTimer
+from PySide6.QtTest import QSignalSpy, QTest
+from PySide6.QtWidgets import QApplication, QDialog, QStyle, QStyleOptionToolButton
 from manimble_linux.app import ManimbleApp
 from manimble_linux.controller import MainController
 from manimble_linux.models import stop_box
@@ -128,20 +129,112 @@ class RealEditorIntegration(unittest.TestCase):
         epoch = (self.c._connection_epoch, self.c._deck_epoch)
         self.assertFalse(self.c.preview_is_current(key, generation, epoch))
 
+    def test_toolbar_refresh_preserves_table_and_expansion_presentation(self):
+        table = self.c._toolbar_buttons['insert_table:word']
+        expand = self.c._toolbar_buttons['toggle_expand_all_builds']
+        left = Qt.MouseButton.LeftButton
+        originally_expanded = self.c.builds_expanded_all
+        text_id = next(int(oid) for oid, obj in self.c.scene['objects'].items() if obj.get('kind') == 'text')
+        try:
+            for selected in ([text_id], []):
+                self.c.canvas.select_group(selected)
+                self.c.actions.refresh()
+                self.assertTrue(table.isEnabled())
+                self.assertEqual(table.text(), 'Table')
+                self.assertEqual(self.c.actions.action('insert_table:word').text(), 'Word Table…')
+            QTest.mouseClick(expand, left)
+            self.c.actions.refresh()
+            expanded = not originally_expanded
+            self.assertEqual(expand.text(), 'Collapse All' if expanded else 'Expand All')
+            context = self.c.navigator_menu(-1)
+            self.assertEqual(context.actions()[0].text(), 'Collapse All Builds' if expanded else 'Expand All Builds')
+            context.deleteLater()
+
+            word = QSignalSpy(self.c.actions.action('insert_table:word').triggered)
+            math = QSignalSpy(self.c.actions.action('insert_table:math').triggered)
+            option = QStyleOptionToolButton()
+            table.initStyleOption(option)
+            face = table.style().subControlRect(QStyle.ComplexControl.CC_ToolButton, option,
+                                                QStyle.SubControl.SC_ToolButton, table)
+            dialogs = []
+
+            def dismiss():
+                dialog = QApplication.activeModalWidget()
+                if isinstance(dialog, QDialog) and dialog.windowTitle().startswith('Insert '):
+                    dialogs.append(dialog.windowTitle())
+                    QTest.keyClick(dialog, Qt.Key.Key_Escape)
+
+            timer = QTimer()
+            timer.timeout.connect(dismiss)
+            timer.start(10)
+            try:
+                QTest.mouseClick(table, left, pos=face.center())
+                end = time.monotonic() + 1
+                while not dialogs and time.monotonic() < end:
+                    QTest.qWait(10)
+                self.assertEqual(dialogs, ['Insert word table'])
+            finally:
+                timer.stop()
+            self.assertEqual((word.count(), math.count()), (1, 0))
+        finally:
+            if self.c.builds_expanded_all != originally_expanded:
+                self.c.toggle_expand_all_builds()
+
+    def test_script_and_replace_leave_the_stage_and_notes_in_place(self):
+        c = self.c
+        bar, find = c.format_bar, c.find_bar
+        initial_page, initial_open = c.drawer.page, c.drawer_open
+        initial_sizes = c.center_split.sizes()
+        c._set_side_pane(2, 360, True)
+        c.drawer.show_page('build_notes')
+        c.set_drawer_open(True)
+        QApplication.processEvents()
+
+        def geometry():
+            QApplication.processEvents()
+            return (c.canvas.viewport().size(), c.canvas.slide_rect.getRect(),
+                    c.center_split.sizes(), c.drawer.page, c.drawer_open)
+
+        before = geometry()
+        left = Qt.MouseButton.LeftButton
+        try:
+            self.assertTrue(bar.script.isVisible() and bar.script.isEnabled())
+            QTest.mouseClick(bar.script, left)
+            self.assertTrue(c.script_pane_is_open())
+            self.assertEqual(geometry(), before)
+            c.show_find()
+            QTest.mouseClick(find.replace_button, left)
+            self.assertTrue(find.replace_row.isVisible())
+            self.assertEqual(geometry(), before)
+            QTest.mouseClick(find.replace_button, left)
+            self.assertFalse(find.replace_row.isVisible())
+            self.assertEqual(geometry(), before)
+            QTest.mouseClick(bar.script, left)
+            self.assertIs(c.inspector_host.currentWidget(), c.inspector_scroll)
+            self.assertEqual(geometry(), before)
+        finally:
+            c.close_find()
+            c.hide_script_pane()
+            c.drawer.show_page(initial_page)
+            c.set_drawer_open(initial_open)
+            c.center_split.setSizes(initial_sizes)
+
     def test_toast_hover_and_stale_timer(self):
+        rect = self.c.canvas.slide_rect.getRect()
         self.c.toast('Older message', error=True)
         self.c.schedule_toast_hide(0.01)
         self.c.toast('Newer error', error=True)
         QTest.qWait(30)
         self.assertFalse(self.c.toast_pill.isHidden())
         self.assertEqual(self.c.toast_pill.label.text(), 'Newer error')
+        self.assertEqual(self.c.canvas.slide_rect.getRect(), rect)
         self.c.toast_pill.hovered = True
         self.c.schedule_toast_hide(0.01)
         QTest.qWait(30)
         self.assertFalse(self.c.toast_pill.isHidden())
         self.c.toast_pill.hovered = False
         self.c.schedule_toast_hide(0.01)
-        QTest.qWait(30)
+        QTest.qWait(350)
         self.assertTrue(self.c.toast_pill.isHidden())
 
     def test_new_build_adds_one_stop_to_static_and_animated_slides(self):

@@ -20,6 +20,7 @@ import json
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import unicodedata
 from pathlib import Path
@@ -1253,17 +1254,18 @@ class BeamerImport:
                 if fam.lower() in installed or _font(fam, False, False) is not None:
                     self.font = installed.get(fam.lower(), fam)
                 elif sans == "helvet":
-                    self.font = "Helvetica"
+                    self.font = "DejaVu Sans" if sys.platform.startswith("linux") else "Helvetica"
                 else:
                     self.warnings.append(f"the document's font '{fam}' is not installed here; Latin Modern Sans is used")
         if self.font is None:
             found = self.tex_fonts(lm)
-            self.font = "Latin Modern Sans" if found.get("regular") else "Helvetica Neue"
+            fallback = "DejaVu Sans" if sys.platform.startswith("linux") else "Helvetica Neue"
+            self.font = "Latin Modern Sans" if found.get("regular") else fallback
             self.font_bundled = bool(found.get("regular"))
             if not found.get("regular"):
-                self.warnings.append("Latin Modern Sans (Beamer's font) was not found in a TeX installation; Helvetica Neue is used")
+                self.warnings.append(f"Latin Modern Sans (Beamer's font) was not found in a TeX installation; {fallback} is used")
         found["mono"] = mono.get("mono")
-        self.mono = "Latin Modern Mono" if found.get("mono") else "Menlo"
+        self.mono = "Latin Modern Mono" if found.get("mono") else ("DejaVu Sans Mono" if sys.platform.startswith("linux") else "Menlo")
         fonts_dir = self.assets / "fonts"
         for k, p in found.items():
             if p:
@@ -1284,7 +1286,7 @@ class BeamerImport:
                 self.pil[key] = None
             if self.pil[key] is None:
                 from .importer import _font_or_fallback
-                self.pil[key] = _font_or_fallback(self.font if not st.get("tt") else "Menlo", bool(st.get("b")),
+                self.pil[key] = _font_or_fallback(self.font if not st.get("tt") else self.mono, bool(st.get("b")),
                                                   bool(st.get("i")))
         f = self.pil[key]
         size = st.get("size") or self.size("normalsize")

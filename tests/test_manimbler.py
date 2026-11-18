@@ -5,7 +5,9 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import stat
 import unittest
+import warnings
 import zipfile
 from pathlib import Path
 
@@ -15,6 +17,122 @@ FFMPEG = shutil.which("ffmpeg")
 FFPROBE = shutil.which("ffprobe")
 MANIM_SLIDES = (shutil.which("manim-slides") or
                 str(Path.home() / "Library/Application Support/Manimble/python/bin/manim-slides"))
+
+
+class SourceOnlyExtractionTests(unittest.TestCase):
+    """Extraction needs neither rendered media nor FFmpeg; ZIP validation remains mandatory."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+
+    def make_package(self, *, order=None, slides=False, deck=True):
+        package = self.root / "source.manimble"
+        with zipfile.ZipFile(package, "w") as archive:
+            archive.writestr("demo/manimble-project.json", json.dumps({
+                "format": "manimble-project", "version": 1, "deckPath": "parent/deck",
+            }))
+            if deck:
+                archive.writestr("demo/parent/deck/slides.py", "class Title:\n    pass\n")
+            if order is not None:
+                archive.writestr("demo/parent/deck/order.txt", order)
+            if slides:
+                archive.writestr("demo/parent/deck/slides/Title.json", "{}")
+        return package
+
+    def run_command(self, *args):
+        return subprocess.run([sys.executable, str(COMMAND), *map(str, args)],
+                              capture_output=True, text=True)
+
+    def test_extract_unrendered_with_and_without_order(self):
+        for order in (None, "", "Title\n"):
+            with self.subTest(order=order):
+                package = self.make_package(order=order)
+                target = self.root / ("without-order" if order is None else "order-" + str(len(order)))
+                result = self.run_command("--extract", package, "-o", target)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual((target / "parent/deck/slides.py").read_text(),
+                                 "class Title:\n    pass\n")
+                self.assertFalse((target / "parent/deck/slides").exists())
+                checked = self.run_command("--check", package)
+                self.assertEqual(checked.returncode, 1)
+                self.assertIn("Missing rendered slide" if order else "No slides", checked.stderr)
+
+    def test_extract_existing_slide_manifest_without_order_or_media(self):
+        package = self.make_package(slides=True)
+        target = self.root / "unpacked"
+        result = self.run_command("--extract", package, "-o", target)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual((target / "parent/deck/slides/Title.json").read_text(), "{}")
+
+    def test_extract_rejects_unsafe_entries_without_publishing(self):
+        for name in ("../escape.txt", "/absolute.txt", "demo/back\\slash.txt", "demo//empty.txt"):
+            with self.subTest(name=name):
+                package = self.make_package()
+                with zipfile.ZipFile(package, "a") as archive:
+                    archive.writestr(name, "unsafe")
+                target = self.root / "unsafe"
+                result = self.run_command("--extract", package, "-o", target)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("Invalid archive entry", result.stderr)
+                self.assertFalse(target.exists())
+
+    def test_extract_rejects_duplicates_and_symlinks(self):
+        for symbolic in (False, True):
+            with self.subTest(symbolic=symbolic):
+                package = self.make_package()
+                with zipfile.ZipFile(package, "a") as archive:
+                    if symbolic:
+                        info = zipfile.ZipInfo("demo/link")
+                        info.create_system = 3
+                        info.external_attr = (stat.S_IFLNK | 0o777) << 16
+                        archive.writestr(info, "../../outside")
+                    else:
+                        with warnings.catch_warnings():
+                            warnings.simplefilter("ignore", UserWarning)
+                            archive.writestr("demo/parent/deck/slides.py", "duplicate")
+                target = self.root / "unsafe"
+                result = self.run_command("--extract", package, "-o", target)
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("symbolic link" if symbolic else "Duplicate archive entry", result.stderr)
+                self.assertFalse(target.exists())
+
+    def test_extract_rejects_corrupt_bytes(self):
+        package = self.make_package()
+        original = package.read_bytes()
+        self.assertIn(b"class Title:", original)
+        package.write_bytes(original.replace(b"class Title:", b"clash Title:", 1))
+        target = self.root / "unsafe"
+        result = self.run_command("--extract", package, "-o", target)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("Damaged archive entry: demo/parent/deck/slides.py", result.stderr)
+        self.assertFalse(target.exists())
+
+    def test_extract_keeps_scene_and_final_deck_validation(self):
+        for order in ("../bad\n", "bad\\name\n", "C:bad\n"):
+            with self.subTest(order=order):
+                package = self.make_package(order=order)
+                result = self.run_command("--extract", package, "-o", self.root / "unsafe")
+                self.assertEqual(result.returncode, 1)
+                self.assertIn("slide name", result.stderr)
+                self.assertFalse((self.root / "unsafe").exists())
+        package = self.make_package(deck=False)
+        result = self.run_command("--extract", package, "-o", self.root / "unsafe")
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("deck folder is missing", result.stderr)
+        self.assertFalse((self.root / "unsafe").exists())
+
+    def test_extract_preserves_existing_destination(self):
+        package = self.make_package()
+        target = self.root / "existing"
+        target.mkdir()
+        marker = target / "keep.txt"
+        marker.write_text("keep")
+        result = self.run_command("--extract", package, "-o", target)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn("already exists", result.stderr)
+        self.assertEqual(marker.read_text(), "keep")
 
 
 @unittest.skipUnless(FFMPEG and FFPROBE, "ffmpeg and ffprobe are required")

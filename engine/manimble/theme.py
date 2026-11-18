@@ -11,6 +11,7 @@ from __future__ import annotations
 import ast
 import os
 import re
+import sys
 
 from . import darkmode as dm
 from .srcedit import Edit, py_str
@@ -40,6 +41,13 @@ def load(theme_id: str) -> dict:
     out["_id"] = theme_id
     if "THEME" not in out or not dm.HEX.fullmatch(str(out.get("BACKGROUND", ""))):
         raise ValueError(f"theme {theme_id!r} lacks THEME or BACKGROUND")
+    if sys.platform.startswith("linux"):
+        font = out.get("FONT")
+        mac_fonts = {"Menlo", "Palatino", "Helvetica Neue", "Chalkboard SE", "Avenir Next"}
+        if font in mac_fonts:
+            from .importer import _font
+            if _font(font, False, False) is None:
+                out["FONT"] = {"Menlo": "DejaVu Sans Mono", "Palatino": "DejaVu Serif"}.get(font, "DejaVu Sans")
     return out
 
 

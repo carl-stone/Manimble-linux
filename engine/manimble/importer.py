@@ -17,11 +17,13 @@ import io
 import math
 import re
 import subprocess
+import sys
 import tempfile
+from functools import lru_cache
 from pathlib import Path
 
 FW, FH = 14.222222222222221, 8.0          # manim frame in units; 1280 x 720 px
-DEFAULT_FONT = "Helvetica Neue"          # used when neither the presentation nor its theme names a font
+DEFAULT_FONT = "DejaVu Sans" if sys.platform.startswith("linux") else "Helvetica Neue"
 PT_PER_FONT_SIZE = 0.945                  # same calibration as the exporter
 
 # Fonts that ship inside Microsoft Office (Calibri, Cambria, ...) are not installed system-wide, but can be used
@@ -107,6 +109,9 @@ def _register_fonts(*names):
 
 
 def keynote_to_pptx(key_path: str, pptx_path: str) -> dict:
+    if sys.platform != "darwin":
+        return {"ok": False, "error": "Keynote .key and legacy .ppt conversion require macOS. "
+                                      "Save the presentation as .pptx and import that instead."}
     from .export import ensure_keynote_running
     if not Path("/Applications/Keynote.app").exists():
         return {"ok": False, "error": "Keynote is not installed, so a .key or .ppt file cannot be read. "
@@ -164,11 +169,40 @@ def _int(v, default=0) -> int:
 _font_cache: dict = {}
 
 
-def _font(family: str, bold: bool, italic: bool):
-    """PIL font (at 1000 px per em) for measuring text the way PowerPoint wraps it, or None if not installed."""
-    key = (family.lower(), bold, italic)
+@lru_cache(maxsize=256)
+def _fontconfig_match(family: str, bold: bool, italic: bool, fallback: bool) -> tuple[str, int] | None:
+    """Fontconfig's file/face match, accepting family substitution only when explicitly requested."""
+    escaped = re.sub(r"([\\,:-])", r"\\\1", family)
+    pattern = escaped + (":weight=bold" if bold else ":weight=regular") + (":slant=italic" if italic else ":slant=roman")
+    try:
+        r = subprocess.run(["fc-match", "--format", "%{family}\n%{file}\n%{index}\n", pattern],
+                           capture_output=True, text=True, timeout=10)
+    except FileNotFoundError as exc:
+        raise RuntimeError("Fontconfig's fc-match is required for Linux font measurement; "
+                           "install the fontconfig package.") from exc
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RuntimeError(f"Fontconfig font matching failed: {exc}") from exc
+    if r.returncode:
+        raise RuntimeError("Fontconfig font matching failed: " + r.stderr.strip())
+    lines = r.stdout.splitlines()
+    if len(lines) < 3 or not lines[1]:
+        return None
+    if not fallback and family.casefold() not in {f.strip().casefold() for f in lines[0].split(",")}:
+        return None
+    return lines[1], int(lines[2])
+
+
+def _font(family: str, bold: bool, italic: bool, *, _fallback: bool = False):
+    """PIL font at 1000 px/em, or None for an unavailable family (unless substitution is requested)."""
+    key = (family.lower(), bold, italic, _fallback)
     if key in _font_cache:
         return _font_cache[key]
+    if sys.platform.startswith("linux"):
+        from PIL import ImageFont
+        match = _fontconfig_match(family, bold, italic, _fallback)
+        found = ImageFont.truetype(match[0], 1000, index=match[1]) if match else None
+        _font_cache[key] = found
+        return found
     want = ("bold " if bold else "") + ("italic" if italic else "")
     want = want.strip() or "regular"
     stem = family.split()[0].lower() if family.split() else family.lower()
@@ -200,8 +234,9 @@ def _font(family: str, bold: bool, italic: bool):
 
 
 def _font_or_fallback(family: str, bold: bool, italic: bool):
-    """The font for measuring, or a common sans-serif when the family is not available anywhere (what Pango
-    will substitute is unknown, but Arial's widths are closer than a fixed average)."""
+    """The font for measuring, using the same Fontconfig substitution as Pango on Linux."""
+    if sys.platform.startswith("linux"):
+        return _font(family, bold, italic, _fallback=True)
     return _font(family, bold, italic) or _font("Arial", bold, italic) or _font("Helvetica", bold, italic)
 
 

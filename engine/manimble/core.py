@@ -1646,10 +1646,11 @@ class Manimble:
     def _wrapped(self, obj: dict, value: str, box: float, shown_w: float) -> str:
         """`value` word-wrapped to `box` manim units in the object's font. Widths come from the font file,
         scaled so the text's current widest line measures what it shows on the slide (shown_w)."""
-        from .importer import _font
+        from .importer import _font, _font_or_fallback
         bold = str(obj.get("weight") or "NORMAL").upper() in ("BOLD", "SEMIBOLD", "ULTRABOLD", "HEAVY", "ULTRAHEAVY")
         italic = str(obj.get("slant") or "NORMAL").upper() in ("ITALIC", "OBLIQUE")
-        ft = _font(obj.get("font") or "Helvetica", bold, italic)
+        lookup = _font_or_fallback if sys.platform.startswith("linux") else _font
+        ft = lookup(obj.get("font") or "Helvetica", bold, italic)
 
         def ems(line: str) -> float:
             line = line.rstrip()
@@ -3351,7 +3352,11 @@ class Manimble:
                     edit = Edit(src.rel, at, at, f"{indent}self.next_slide()\n{indent}self.wait(0.1)  {self.NEW_BUILD_MARK}\n")
                 else:                               # after the last build: at the end of construct()
                     last = fn.body[-1]
-                    edit = _after_stmt(src, last, f"self.next_slide()\n{' ' * last.col_offset}self.wait(0.1)  {self.NEW_BUILD_MARK}")
+                    pad = " " * last.col_offset
+                    # manim-slides ignores a next_slide() before anything is animated, so a static single build
+                    # is first materialized by a wait of its own, or the new build would not appear
+                    head = f"self.wait(0.1)\n{pad}" if len(stops) == 1 and stops[0].get("anim") is None else ""
+                    edit = _after_stmt(src, last, f"{head}self.next_slide()\n{pad}self.wait(0.1)  {self.NEW_BUILD_MARK}")
             except (EditError, KeyError) as exc:
                 return {"ok": False, "error": f"A build cannot be added here: {exc}"}
             try:
@@ -3925,10 +3930,9 @@ class Manimble:
     BUILD_SLOTS = max(1, min(3, (os.cpu_count() or 2) // 2))
 
     def _build_media(self, slot: int) -> str:
-        """Slot 0 builds in the deck's ../media as it always has. The others get media dirs of their own (LaTeX's
-        cleanup deletes every non-SVG file in its tex dir, so two runs sharing one break each other); they all
-        share SVGs through the editor workers' pool (MANIMBLE_SHARED_MEDIA, read by slides_render.py)."""
-        return "../media" if slot == 0 else str(self.cache_dir / "media" / f"build-{slot}")
+        """Isolate concurrent build slots; Linux also isolates slot zero from mirrored project media.
+        All slots share SVGs through MANIMBLE_SHARED_MEDIA (read by slides_render.py)."""
+        return "../media" if slot == 0 and not sys.platform.startswith("linux") else str(self.cache_dir / "media" / f"build-{slot}")
 
     def _build_animation_slides(self, selected: list[dict], event: str, height: int = 720, progress=None) -> bool:
         """Build the selected scenes with manim where their code (or the resolution asked for) changed since the

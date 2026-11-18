@@ -1,7 +1,7 @@
 # Installation
 
-Manimble runs on macOS 13 (Ventura) or later, on both Apple Silicon and Intel Macs. Windows and Linux versions are
-planned.
+Manimble runs on macOS 13 (Ventura) or later, on both Apple Silicon and Intel Macs. A Linux front end supports
+Ubuntu 24.04 and Arch/Omarchy on x86_64. The sections below describe macOS unless marked Linux. Windows is planned.
 
 ## Install the app
 
@@ -78,3 +78,38 @@ Drag Manimble from Applications to the Trash. To remove everything it installed,
 - `~/Library/TinyTeX`, if Manimble installed TinyTeX and nothing else uses it
 
 Your decks are never stored inside these folders.
+
+## Linux
+
+The Linux app uses Qt Widgets and supports Wayland and X11. It needs system Python 3.11 through 3.14.
+Clone the repository and run the installer from its root:
+
+```bash
+git clone https://github.com/pachterlab/Manimble.git
+cd Manimble
+./install_manimble.sh
+~/.local/bin/manimble examples/hello/deck
+```
+
+The installer prints the native package and Python package plans before requesting consent. Ubuntu 24.04 uses
+`apt-get install`, and Arch uses `pacman -S --needed` without a full-system upgrade. Use `--no-system-deps` on a
+preprovisioned machine, `--system-deps` to request native installation, or `--yes` to accept the printed plan.
+Unsupported distributions receive package and missing-tool guidance instead of automatic system changes.
+
+The app and its private Python environment are copied into `$XDG_DATA_HOME/manimble`, which defaults to
+`~/.local/share/manimble`. Launchers are installed in `~/.local/bin`. The checkout can be removed after installation.
+Preferences, caches and working copies use the XDG config, cache and state directories. Rerun the installer after
+pulling updates. Desktop registration does not change the default handler for `.manimble` files.
+
+Ubuntu may need an AppArmor user namespace exception for the installed `QtWebEngineProcess`. The installer asks
+for separate permission and scopes the profile to that exact executable. `--install-webengine-profile` explicitly
+approves the exception, while `--yes` alone does not. Without the required permission, the terminal remains
+unavailable. Chromium sandboxing stays enabled.
+
+The optional extraction model is not installed by the main installer. Keynote and legacy `.ppt` conversions
+require macOS, so use `.pptx` on Linux. Protected distro TeX installations need their distro packages rather than
+privileged `tlmgr` changes.
+
+See the [Linux README](https://github.com/pachterlab/Manimble/blob/main/apps/linux/README.md) for development,
+testing and installed paths.
+

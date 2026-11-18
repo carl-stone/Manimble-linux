@@ -49,7 +49,7 @@ def _relative_path(value: object, description: str) -> str:
     return value
 
 
-def _project(archive: zipfile.ZipFile) -> Project:
+def _project(archive: zipfile.ZipFile, *, require_scenes: bool = True) -> Project:
     names = set(archive.namelist())
     manifests = [name for name in names if name.endswith("/manimble-project.json")
                  and not name.startswith("__MACOSX/")]
@@ -76,7 +76,7 @@ def _project(archive: zipfile.ZipFile) -> Project:
         scenes = sorted(name[len(prefix):-5] for name in names
                         if name.startswith(prefix) and name.endswith(".json")
                         and "/" not in name[len(prefix):])
-    if not scenes:
+    if require_scenes and not scenes:
         raise ConversionError("No slides found in the package")
     for scene in scenes:
         if "/" in scene:
@@ -331,7 +331,7 @@ def extract(source: Path, destination: Path) -> Path:
     _output_ready(source, destination, overwrite=False)
     with _open_package(source) as archive:
         _validate_archive(archive)
-        project = _project(archive)
+        project = _project(archive, require_scenes=False)
         prefix = project.root + "/"
         with tempfile.TemporaryDirectory(prefix=".manimbler-", dir=destination.parent) as temporary:
             stage = Path(temporary) / "project"

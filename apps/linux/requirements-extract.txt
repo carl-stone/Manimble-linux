@@ -1,0 +1,5 @@
+torch==2.15.0+cpu
+torchvision==0.29.2+cpu
+setuptools>=61.0
+wheel
+SAM-2 @ https://github.com/facebookresearch/sam2/archive/2b90b9f5ceec907a1c18123530e92e794ad901a4.tar.gz

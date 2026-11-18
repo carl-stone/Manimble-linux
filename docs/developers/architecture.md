@@ -16,6 +16,23 @@ Manimble.app  (Swift, AppKit, Metal)                 engine/manimble  (Python)
  └ working copy of the deck (Workspace.swift)          worker.py   runs scenes in Manim, records what it sees
 ```
 
+The Linux front end lives under `apps/linux/manimble_linux/` and uses PySide6 Qt Widgets. It shares the engine
+and existing deck/project formats with macOS rather than translating Swift or adding another engine.
+`RpcClient` starts the engine with `QProcess` and exchanges the same JSON-line requests, replies and events.
+Mutations are serialized by the controller, and Qt signals return results to the GUI thread.
+
+The Linux canvas paints exact frames when idle and composites sprites during edits. Its terminal uses local
+xterm.js resources and a separate Python PTY helper, so the multithreaded Qt process never forks a shell itself.
+Blocking file and HTTP work uses a bounded worker pool. Model inference, image fill and narrated movie composition
+run in cancellable worker processes.
+
+Linux working copies live under `$XDG_STATE_HOME/manimble`, with preferences in the XDG config directory and
+renders and downloads in the XDG cache directory. The installer copies the app to `$XDG_DATA_HOME/manimble/app`
+and creates its private environment at the stable path `$XDG_DATA_HOME/manimble/python`.
+See the [Linux README](https://github.com/pachterlab/Manimble/blob/main/apps/linux/README.md) for installation
+and tests. The macOS rendering and release paths below remain unchanged.
+
+
 ## Rendering
 
 The **worker** runs a slide's real code in Manim, with animations fast-forwarded to their end states. As it runs, it
@@ -59,6 +76,7 @@ apps/macos/              the macOS app: Package.swift, Sources/Manimble (AppKit,
 apps/macos/install_dependencies.sh       what the first-launch setup runs to install Python and LaTeX
 apps/macos/tools/build_python_runtime.sh  builds the self-contained Python runtime attached to each release
 apps/windows/            notes for a future Windows front end
+apps/linux/              the Linux Qt Widgets front end, PTY helper, worker entry points and installer
 install_manimble.sh      installs dependencies and builds ~/Applications/Manimble.app
 setup_python_env.sh      installs the Python, Manim and TeX dependencies with Homebrew
 manimbler                the command-line tool for .manimble packages

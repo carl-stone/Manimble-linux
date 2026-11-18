@@ -1,5 +1,26 @@
 # Keyboard shortcuts
 
+## Linux mapping
+
+On Linux, use Ctrl for Command (⌘) and Alt for Option (⌥) in the macOS tables below. Shift stays Shift.
+Linux overrides the following shortcuts to avoid desktop and terminal conflicts:
+
+| Shortcut | Command |
+|---|---|
+| F5 | Play from Beginning |
+| Shift+F5 | Play from Current Slide |
+| Ctrl+F5 | Presenter View |
+| Alt+F5 | Preview Current Slide's Animations |
+| Ctrl+Alt+Shift+D | Dark Mode |
+| Ctrl+Alt+Shift+I | Invert Colors |
+| Ctrl+Alt+F12 | Auxiliary pane |
+| Ctrl+M | Minimize the window |
+
+When the terminal has focus, deck editing shortcuts are disabled. Ctrl+C interrupts the foreground command,
+and Ctrl+Z suspends it. Ctrl+Shift+C and Ctrl+Shift+V copy and paste. Ctrl+Shift+F searches scrollback, and
+Ctrl+Shift+A selects terminal text. Terminal controls remain available through their menus and buttons.
+Super is not reserved, and Manimble does not modify desktop keybindings.
+
 ## Files
 
 | Shortcut | Command |

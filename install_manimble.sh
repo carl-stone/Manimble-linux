@@ -1,6 +1,11 @@
 #!/bin/bash
 # Install Manimble's Python and rendering dependencies, then build the app.
 set -euo pipefail
+case "$(uname -s)" in
+    Linux) exec "$(dirname "$0")/apps/linux/install.sh" "$@" ;;
+    Darwin) ;;
+    *) echo "Manimble supports macOS and Linux." >&2; exit 1 ;;
+esac
 cd "$(dirname "$0")"
 ROOT="$PWD"
 

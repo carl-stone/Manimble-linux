@@ -1,12 +1,13 @@
-"""LaTeX packages a Beamer deck needs: which are missing on this Mac, and installing them with tlmgr once the user
-has agreed (never on its own). A system-wide TeX (MacTeX, BasicTeX) asks for an administrator password through
-macOS, as install_dependencies.sh does; TinyTeX in the user's Library takes packages without one."""
+"""Find and install a Beamer deck's missing TeX packages, only after user consent.
+Writable user TeX uses tlmgr. Protected Linux/distro TeX requires distro packages; macOS retains its
+administrator-password flow for MacTeX/BasicTeX."""
 from __future__ import annotations
 
 import os
 import re
 import shlex
 import subprocess
+import sys
 from pathlib import Path
 
 from .beamer_import import find_tool, strip_comments
@@ -81,10 +82,26 @@ def package_of(tlmgr: str, f: str) -> str | None:
 def install(files: list[str], progress=None) -> dict:
     """Install the TeX Live packages that ship `files`. {ok, installed: [package], missing: [file still missing],
     error?}. Only call this after the user said yes."""
+    guidance = ("This TeX installation is managed by your Linux distribution or is not writable. "
+                "Install the missing TeX packages with your distribution's package manager "
+                "(Ubuntu: apt install texlive-latex-extra texlive-fonts-extra texlive-science; "
+                "Arch: pacman -S texlive-latexextra texlive-fontsextra texlive-mathscience).")
     tlmgr = find_tool("tlmgr")
     if not tlmgr:
+        if sys.platform != "darwin":
+            return {"ok": False, "error": "No tlmgr was found. " + guidance, "missing": files}
         return {"ok": False, "error": "No TeX package manager (tlmgr) was found. Install LaTeX first with "
                                       "Manimble ▸ Install Dependencies…"}
+    if sys.platform != "darwin":
+        kpse = find_tool("kpsewhich")
+        try:
+            root = subprocess.run([kpse, "-var-value", "TEXMFROOT"], capture_output=True,
+                                  text=True).stdout.strip() if kpse else ""
+        except OSError as exc:
+            return {"ok": False, "error": f"Cannot inspect the TeX installation: {exc}", "missing": files}
+        distro = Path(tlmgr).resolve().parent in (Path("/usr/bin"), Path("/bin"))
+        if distro or not root or not os.access(os.path.join(root, "tlpkg"), os.W_OK):
+            return {"ok": False, "error": guidance, "missing": files}
     pkgs: list[str] = []
     for i, f in enumerate(files):
         if progress:
@@ -97,12 +114,13 @@ def install(files: list[str], progress=None) -> dict:
                 " (or it could not be reached; check the internet connection)"}
     if progress:
         progress(len(files), len(files), "Installing " + ", ".join(pkgs))
-    kpse = find_tool("kpsewhich")
-    root = subprocess.run([kpse, "-var-value", "TEXMFROOT"], capture_output=True, text=True).stdout.strip() if kpse else ""
+    if sys.platform == "darwin":
+        kpse = find_tool("kpsewhich")
+        root = subprocess.run([kpse, "-var-value", "TEXMFROOT"], capture_output=True, text=True).stdout.strip() if kpse else ""
     # tlmgr refuses to install once CTAN has a newer tlmgr than itself, so it updates itself first
     cmd = f"{shlex.quote(tlmgr)} update --self; {shlex.quote(tlmgr)} install " + " ".join(shlex.quote(p) for p in pkgs)
     try:
-        if root and os.access(os.path.join(root, "tlpkg"), os.W_OK):
+        if sys.platform != "darwin" or (root and os.access(os.path.join(root, "tlpkg"), os.W_OK)):
             r = subprocess.run(["/bin/sh", "-c", cmd], capture_output=True, text=True, timeout=1800)
         else:
             # a system TeX lives in a folder only an administrator can change: macOS asks for the password

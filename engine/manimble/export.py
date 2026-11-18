@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 
@@ -141,6 +142,8 @@ def build_pptx(app, path: str, builds: bool = False, editable: bool = True, prog
 
 def pptx_to_keynote(pptx_path: str, key_path: str) -> dict:
     """Open the .pptx in Keynote and save it as a Keynote document."""
+    if sys.platform != "darwin":
+        return {"ok": False, "error": "Keynote .key conversion requires macOS. Export as .pptx instead."}
     if not Path("/Applications/Keynote.app").exists():
         return {"ok": False, "error": "Keynote is not installed; open the exported .pptx in Keynote instead."}
     ensure_keynote_running()

@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Manimble
+Comment=Edit and present Manim slides
+Exec=@MANIMBLE_EXEC@ %F
+Icon=manimble
+Terminal=false
+Categories=Graphics;Education;
+MimeType=application/x-manimble-project;
+StartupNotify=true
